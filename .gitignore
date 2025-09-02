@@ -1,0 +1,71 @@
+# ------------------------
+# Python
+# ------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dll
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+myenv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+logs/
+*.log
+
+# Configs (local only)
+*.env
+config.local.yaml
+
+# Models
+models/*.zip
+models/*.pth
+models/*.h5
+
+# Data
+data/
+historical_data/
+*.csv
+
+# Cache
+*.cache
+*.tmp
+
+# Build / Dist
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# C++ build artifacts
+cpp/*.o
+cpp/*.obj
+cpp/*.lib
+cpp/*.exp
+cpp/*.pdb
+cpp/*.dll
+cpp/*.so
+cpp/*.a
+
+# Compiled Python bindings
+core/execution_engine.*.pyd
+core/execution_engine.*.so
+core/execution_engine.cp*.pyd
+
+# OS files
+.DS_Store
+Thumbs.db

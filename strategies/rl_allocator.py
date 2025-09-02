@@ -1,7 +1,9 @@
 import os
+import random
 import numpy as np
 from stable_baselines3 import PPO
 from strategies.rl_allocator_env import RLAllocatorEnv
+
 
 class RLAllocator:
     def __init__(self, asset_strategies, multi_asset_returns, greek_exposures,
@@ -12,18 +14,38 @@ class RLAllocator:
         self.multi_asset_returns = multi_asset_returns
         self.greek_exposures = greek_exposures
         self.window_size = window_size
+        self.strikes = strikes
+        self.expiries = expiries
 
         # Env used for inference
         self.env = RLAllocatorEnv(asset_strategies, strikes, expiries)
 
-        if not os.path.exists(model_path + ".zip"):
-            raise FileNotFoundError(f"❌ RL Allocator model not found at {model_path}")
-
-        self.model = PPO.load(model_path)
-        self.obs = self.env.reset()
+        # Check if model exists
+        model_file = model_path + ".zip"
+        if not os.path.exists(model_file):
+            print(f"⚠️ RL model not found at {model_file}, using random allocator instead")
+            self.model = None
+            self.obs = None
+        else:
+            self.model = PPO.load(model_path)
+            self.obs = self.env.reset()
 
     def choose_action(self):
-        """Predict next action = (strategy, strike_offset, expiry)"""
+        """Predict next action = (strategy, strike_offset, expiry).
+        Falls back to random if no model is available.
+        """
+        if self.model is None:
+            # fallback: pick random strategy/strike/expiry
+            strategy = random.choice(self.asset_strategies)
+            strike_offset = random.choice(self.strikes)
+            expiry = random.choice(self.expiries)
+            return {
+                "strategy": strategy,
+                "strike_offset": strike_offset,
+                "expiry": expiry
+            }
+
+        # RL agent prediction
         action, _ = self.model.predict(self.obs, deterministic=True)
         strategy_idx, strike_idx, expiry_idx = action
 

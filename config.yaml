@@ -1,0 +1,64 @@
+api_key: YOUR_API_KEY
+api_secret: YOUR_API_SECRET
+risk_per_trade: 0.01
+max_drawdown: 0.2
+instrument_token: 738561   # NIFTY 50
+lot_size: 50
+initial_balance: 100000
+
+# ----------------------------
+# Trading Configuration
+# ----------------------------
+trading:
+  mode: "paper"                # backtest | paper | live
+  broker: "zerodha"            # for live mode
+  initial_balance: 100000       # starting capital for paper/backtest
+  instruments: [256265, 260105] # instrument tokens: NIFTY=256265, BANKNIFTY=260105
+  poll_interval: 5              # seconds between trade loop checks
+
+# ----------------------------
+# Market Timings
+# ----------------------------
+market:
+  open: "00:00:00" # "09:15:00"
+  close: "23:59:59" # "15:30:00"
+
+# ----------------------------
+# Risk Management
+# ----------------------------
+risk:
+  max_position_size: 100        # max lot size per trade
+  max_daily_loss: 20000         # stop trading for the day if loss > X
+  max_drawdown: 50000           # maximum loss from peak equity
+  stop_on_loss: true            # hard stop for the day if risk breached
+  cool_off_minutes: 15          # pause trading after risk breach (if stop_on_loss=false)
+  max_consecutive_losses: 3     # stop trading after N consecutive losses
+
+# ----------------------------
+# Options Optimizer
+# ----------------------------
+options_optimizer:
+  enabled: true
+  strike_selection: "atm"   # <-- add this ("atm" | "otm" | "custom")
+  strategy: "basic_spread"      # basic_spread | straddle | strangle
+  max_iv: 0.35
+  expiry_selection: "weekly"   # <-- add this ("weekly" | "monthly" | "both")
+  min_iv: 0.15
+  lot_size: 50
+  max_open_positions: 5    # <--- NEW
+
+# ----------------------------
+# RL Allocator
+# ----------------------------
+rl_allocator:
+  strikes: [-200, -100, 0, 100, 200]  # offsets from ATM
+  expiries: ["weekly", "monthly"]     # expiries to consider
+  model_path: "models/best_allocator_strike_expiry"
+
+# ----------------------------
+# Logging
+# ----------------------------
+logging:
+  level: "INFO"
+  logfile: "logs/trading.log"
+
