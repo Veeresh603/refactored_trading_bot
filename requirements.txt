@@ -1,0 +1,4 @@
+torch
+yaml
+streamlit
+plotly
