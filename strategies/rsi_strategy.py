@@ -1,25 +1,22 @@
-import fastindicators as fi
 import pandas as pd
+from strategies.base_strategy import BaseStrategy
 
-class MovingAverageStrategy:
-    def __init__(self, short_window=20, long_window=50):
-        self.short_window = short_window
-        self.long_window = long_window
 
-    def fit(self, data: pd.DataFrame):
-        # SMA doesn't need training, but ML/RL models would train here
-        pass
+class RSIStrategy(BaseStrategy):
+    def __init__(self, period=14, lower=30, upper=70, asset="NIFTY"):
+        super().__init__(name="RSI", asset=asset)
+        self.period = period
+        self.lower = lower
+        self.upper = upper
 
-    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
-        prices = data["close"].tolist()
-        sma_short = fi.sma(prices, self.short_window)
-        sma_long = fi.sma(prices, self.long_window)
-
-        data["signal"] = "HOLD"
-        for i in range(len(prices)):
-            if i >= self.long_window:
-                if sma_short[i] > sma_long[i]:
-                    data.at[i, "signal"] = "BUY"
-                elif sma_short[i] < sma_long[i]:
-                    data.at[i, "signal"] = "SELL"
-        return data
+    def generate_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        delta = df["close"].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(self.period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(self.period).mean()
+        rs = gain / loss.replace(0, 1)
+        df["rsi"] = 100 - (100 / (1 + rs))
+        df["signal"] = 0
+        df.loc[df["rsi"] < self.lower, "signal"] = 1
+        df.loc[df["rsi"] > self.upper, "signal"] = -1
+        return df[["time", "signal"]]

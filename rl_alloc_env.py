@@ -1,5 +1,4 @@
 import gymnasium as gym
-from gym import spaces
 import numpy as np
 
 class PortfolioAllocEnv(gym.Env):
@@ -17,10 +16,10 @@ class PortfolioAllocEnv(gym.Env):
         self.window = window
 
         # Action space: portfolio weights across strategies
-        self.action_space = spaces.Box(low=0, high=1, shape=(self.n_strats,), dtype=np.float32)
+        self.action_space = gym.spaces.Box(low=0, high=1, shape=(self.n_strats,), dtype=np.float32)
 
         # Observation space: recent returns per strategy
-        self.observation_space = spaces.Box(
+        self.observation_space = gym.spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(self.n_strats * self.window,),
             dtype=np.float32

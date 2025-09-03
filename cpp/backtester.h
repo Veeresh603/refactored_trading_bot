@@ -1,6 +1,18 @@
-#pragma once
-#include <string>
-#include <vector>
+#ifndef BACKTESTER_H
+#define BACKTESTER_H
 
-// Run a backtest on historical prices with a given strategy
-double backtest_strategy(const std::vector<double> &prices, const std::string &strategy);
+#include <vector>
+#include <unordered_map>
+
+// Run options backtest
+std::unordered_map<std::string, std::vector<double>> backtest_options(
+    const std::vector<double>& spot_prices,
+    const std::vector<int>& signals,
+    double strike,
+    double sigma,
+    double expiry_days,
+    double initial_balance,
+    double fee_perc
+);
+
+#endif // BACKTESTER_H

@@ -1,4 +1,30 @@
+# Core ML/AI
 torch
-yaml
-streamlit
+numpy
+pandas
+scikit-learn
+
+# Deep Learning Models
+transformers   # for transformer-based models
+
+# Data Handling
+PyYAML
+python-dotenv
+
+# Visualization & Dashboards
+matplotlib
 plotly
+streamlit
+
+# Broker APIs
+kiteconnect    # Zerodha Kite API
+# smartapi-python  # Uncomment if using AngelOne
+# truedata-ws      # Uncomment if using TrueData feeds
+
+# Utilities
+requests
+tqdm
+joblib
+
+# C++ bindings
+pybind11

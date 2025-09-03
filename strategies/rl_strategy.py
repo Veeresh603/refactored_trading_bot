@@ -1,39 +1,55 @@
+"""
+RL Strategy
+-----------
+- Loads trained RL agent (Stable-Baselines3 PPO)
+- Generates actions from market data
+- Plug-and-play with StrategyEngine
+"""
+
 import os
 import numpy as np
 from stable_baselines3 import PPO
-from strategies.rl_env import add_indicators
 
 
 class RLStrategy:
-    def __init__(self, model_dir="models/walkforward", window_size=30):
+    def __init__(self, model_dir="models/walkforward", window_size=30, asset="NIFTY"):
         self.model_dir = model_dir
         self.window_size = window_size
+        self.asset = asset
         self.model = self._load_latest_model()
 
     def _load_latest_model(self):
         models = [f for f in os.listdir(self.model_dir) if f.endswith(".zip")]
         if not models:
-            raise FileNotFoundError("No accepted PPO models found in walkforward directory.")
-        latest_model = max(models, key=lambda x: os.path.getctime(os.path.join(self.model_dir, x)))
-        print(f"📂 Loading latest accepted PPO model: {latest_model}")
-        return PPO.load(os.path.join(self.model_dir, latest_model))
+            raise FileNotFoundError(f"No RL models found in {self.model_dir}")
+        latest = sorted(models)[-1]
+        return PPO.load(os.path.join(self.model_dir, latest))
 
-    def generate_signals(self, df):
-        df = df.copy()
-        df = add_indicators(df)
-        df["signal"] = "HOLD"
+    def generate_signals(self, obs: np.ndarray):
+        """
+        Generate signals from observation batch.
 
-        if len(df) < self.window_size:
-            return df
+        Args:
+            obs (np.ndarray): environment observations
 
-        obs = df[["open", "high", "low", "close", "volume", "rsi", "macd", "signal", "atr"]].tail(self.window_size).values
-        obs = np.expand_dims(obs, axis=0)
+        Returns:
+            list[int]: signals (1=buy, -1=sell, 0=hold)
+        """
+        actions, _ = self.model.predict(obs)
+        return actions.tolist()
 
-        action, _ = self.model.predict(obs, deterministic=True)
+    def evaluate(self, market_data):
+        """
+        Adapter for StrategyEngine (single timestep).
+        """
+        obs = market_data.get("obs")
+        if obs is None:
+            return {"asset": self.asset, "signal": 0}
 
-        if action == 1:
-            df.iloc[-1, df.columns.get_loc("signal")] = "BUY"
-        elif action == 2:
-            df.iloc[-1, df.columns.get_loc("signal")] = "SELL"
-
-        return df
+        action, _ = self.model.predict(obs)
+        signal = int(action)
+        if signal == 1:
+            return {"asset": self.asset, "signal": 1}
+        elif signal == 2:
+            return {"asset": self.asset, "signal": -1}
+        return {"asset": self.asset, "signal": 0}

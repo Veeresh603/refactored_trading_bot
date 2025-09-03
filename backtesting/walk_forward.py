@@ -1,99 +1,94 @@
 """
-Walk-Forward Portfolio with Dynamic Allocation
-----------------------------------------------
-Supports:
-- equal allocation
-- custom weights
-- sharpe-based allocation
-- RL-based allocation
+Walk-Forward Backtesting
+------------------------
+- Splits data into rolling train/test windows
+- Retrains models (if applicable) on train sets
+- Tests on next window using Backtester
 """
 
-import fastbt
 import pandas as pd
-import numpy as np
-from backtesting.metrics import sharpe_ratio
+import logging
+from backtesting.backtest import Backtester
 
 
-class WalkForwardPortfolio:
-    def __init__(self, strategies, allocation="equal", train_window=252, test_window=63, initial_balance=100000, rl_allocator=None):
+class WalkForwardTester:
+    def __init__(self, broker=None, initial_balance=100000, risk_cfg=None, exec_cfg=None,
+                 rl_allocator=None, options_optimizer=None, ensemble=None,
+                 train_size=252, test_size=63):
         """
-        strategies: list of strategy objects
-        allocation: "equal", "sharpe", dict, or "rl"
-        rl_allocator: RL agent (only used if allocation="rl")
+        Args:
+            broker: broker interface (optional, not used in backtest)
+            initial_balance: starting capital
+            risk_cfg: dict of risk manager config
+            exec_cfg: dict of execution config
+            rl_allocator: RLAllocator instance
+            options_optimizer: OptionsOptimizer instance
+            ensemble: EnsembleEngine instance
+            train_size: rolling training window (days)
+            test_size: rolling test window (days)
         """
-        self.strategies = strategies
-        self.train_window = train_window
-        self.test_window = test_window
+        self.logger = logging.getLogger("WalkForwardTester")
         self.initial_balance = initial_balance
-        self.allocation = allocation
+        self.risk_cfg = risk_cfg
+        self.exec_cfg = exec_cfg
         self.rl_allocator = rl_allocator
+        self.options_optimizer = options_optimizer
+        self.ensemble = ensemble
+        self.train_size = train_size
+        self.test_size = test_size
 
-    def run(self, data: pd.DataFrame):
-        n = len(data)
-        portfolio_results = []
-        portfolio_equity_curves = []
+    def run(self, df: pd.DataFrame, asset="NIFTY", iv=0.2, trend="neutral"):
+        """
+        Run walk-forward backtest.
 
-        for start in range(0, n - (self.train_window + self.test_window), self.test_window):
-            train_data = data.iloc[start:start+self.train_window].copy()
-            test_data = data.iloc[start+self.train_window:start+self.train_window+self.test_window].copy()
+        Args:
+            df (DataFrame): OHLCV data with datetime index
+            asset (str): trading asset
+            iv (float): default implied volatility
+            trend (str): market assumption
 
-            strategy_balances = {}
-            strategy_equities = {}
-            strategy_returns = {}
+        Returns:
+            dict: aggregated results {equity_curve, trades, metrics}
+        """
+        results = []
+        all_trades = []
+        all_equity = []
 
-            for strat in self.strategies:
-                strat_name = strat.__class__.__name__
+        start = 0
+        while start + self.train_size + self.test_size <= len(df):
+            train_df = df.iloc[start:start + self.train_size]
+            test_df = df.iloc[start + self.train_size:start + self.train_size + self.test_size]
 
-                strat.fit(train_data)
-                strat_test = strat.generate_signals(test_data.copy())
+            self.logger.info(f"🔄 Training on {train_df.index[0].date()} → {train_df.index[-1].date()}, "
+                             f"testing on {test_df.index[0].date()} → {test_df.index[-1].date()}")
 
-                signal_map = {"BUY": 1, "SELL": -1, "HOLD": 0}
-                signals = [signal_map.get(s, 0) for s in strat_test["signal"].tolist()]
+            # TODO: retrain ensemble/RL models here if needed
+            # e.g. self.ensemble.retrain(train_df)
 
-                trades = fastbt.backtest(strat_test["close"].tolist(), signals)
+            backtester = Backtester(
+                broker=None,
+                initial_balance=self.initial_balance if not results else results[-1]["equity_curve"]["equity"].iloc[-1],
+                risk_cfg=self.risk_cfg,
+                exec_cfg=self.exec_cfg,
+                rl_allocator=self.rl_allocator,
+                options_optimizer=self.options_optimizer,
+                ensemble=self.ensemble,
+            )
 
-                pnl = sum([t.pnl for t in trades])
-                final_balance = self.initial_balance + pnl
-                strategy_balances[strat_name] = final_balance
+            result = backtester.run(test_df, asset=asset, iv=iv, trend=trend)
 
-                # Equity curve
-                equity_curve = [self.initial_balance]
-                for t in trades:
-                    equity_curve.append(equity_curve[-1] + t.pnl)
-                strategy_equities[strat_name] = pd.Series(equity_curve)
-                strategy_returns[strat_name] = pd.Series(np.diff(equity_curve) / equity_curve[:-1])
+            results.append(result)
+            all_trades.append(result["trades"])
+            all_equity.append(result["equity_curve"])
 
-            # -------------------------------
-            # Dynamic Allocation
-            # -------------------------------
-            if self.allocation == "equal":
-                weight = 1.0 / len(self.strategies)
-                final_balance = sum(b * weight for b in strategy_balances.values())
+            start += self.test_size  # roll forward
 
-            elif isinstance(self.allocation, dict):
-                final_balance = sum(
-                    strategy_balances[name] * self.allocation.get(name, 0)
-                    for name in strategy_balances
-                )
+        # Combine
+        combined_trades = pd.concat(all_trades).reset_index(drop=True) if all_trades else pd.DataFrame()
+        combined_equity = pd.concat(all_equity).reset_index(drop=True) if all_equity else pd.DataFrame()
 
-            elif self.allocation == "sharpe":
-                sharpes = {name: sharpe_ratio(returns.dropna()) 
-                           for name, returns in strategy_returns.items()}
-                total = sum(abs(v) for v in sharpes.values())
-                weights = {name: abs(v)/total for name, v in sharpes.items()}
-                final_balance = sum(strategy_balances[name] * weights[name] for name in strategy_balances)
-
-            elif self.allocation == "rl" and self.rl_allocator is not None:
-                weights = self.rl_allocator.allocate(strategy_returns, online_update=True, update_steps=2000)
-                final_balance = sum(strategy_balances[name] * weights[name] for name in strategy_balances)
-
-            else:
-                raise ValueError("Unsupported allocation method")
-
-            portfolio_results.append(final_balance)
-
-            # Combine equity curves (weighted sum)
-            combined_equity = sum(strategy_equities.values()) / len(strategy_equities)
-            portfolio_equity_curves.append(combined_equity)
-
-        return portfolio_results, portfolio_equity_curves
+        return {
+            "equity_curve": combined_equity,
+            "trades": combined_trades,
+            "metrics": results[-1]["metrics"] if results else {},
+        }

@@ -1,88 +1,76 @@
 """
-Utils Module
-------------
-- Logging
-- Config loader
-- Telegram alerts
+Utils
+-----
+General-purpose utilities:
+- Telegram messaging
+- File sending
+- Logging helpers
+- Common time/dir helpers
 """
 
-import logging
-import yaml
-import requests
 import os
+import logging
+import requests
+from datetime import datetime
+
+logger = logging.getLogger("Utils")
+
+# ----------------------------
+# Telegram Helpers
+# ----------------------------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# -------------------------------
-# Logging Setup
-# -------------------------------
-def setup_logger(name="TradingBot", log_file="logs/trading_bot.log", level=logging.INFO):
-    """
-    Setup logger with file + console output
-    """
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-
-    # Avoid duplicate handlers
-    if not logger.handlers:
-        # File handler
-        fh = logging.FileHandler(log_file)
-        fh.setLevel(level)
-
-        # Console handler
-        ch = logging.StreamHandler()
-        ch.setLevel(level)
-
-        # Formatter
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        fh.setFormatter(formatter)
-        ch.setFormatter(formatter)
-
-        logger.addHandler(fh)
-        logger.addHandler(ch)
-
-    return logger
-
-
-# -------------------------------
-# Config Loader
-# -------------------------------
-def load_config(path="config/config.yaml"):
-    """
-    Load config from YAML file
-    """
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
-
-
-# -------------------------------
-# Telegram Alerts
-# -------------------------------
-def send_telegram_message(message, bot_token=None, chat_id=None):
-    """
-    Send a Telegram alert
-    """
-    bot_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
-
-    if not bot_token or not chat_id:
-        print("⚠️ Telegram credentials not found in ENV.")
-        return False
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message}
-
+def send_telegram_message(msg: str):
+    """Send text message to Telegram (if enabled)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.debug(f"Telegram not configured. Message skipped: {msg}")
+        return
     try:
-        response = requests.post(url, data=payload)
-        if response.status_code == 200:
-            print(f"📩 Telegram message sent: {message}")
-            return True
-        else:
-            print(f"❌ Telegram send failed: {response.text}")
-            return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+        if resp.status_code != 200:
+            logger.warning(f"Telegram message failed: {resp.text}")
     except Exception as e:
-        print(f"❌ Telegram error: {e}")
-        return False
+        logger.error(f"Telegram send error: {e}")
+
+
+def send_telegram_file(filepath: str, caption: str = ""):
+    """Send file (PDF/CSV/IMG) to Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.debug("Telegram not configured. File skipped.")
+        return
+    if not os.path.exists(filepath):
+        logger.error(f"File not found for Telegram send: {filepath}")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+        with open(filepath, "rb") as f:
+            resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption}, files={"document": f})
+        if resp.status_code != 200:
+            logger.warning(f"Telegram file send failed: {resp.text}")
+    except Exception as e:
+        logger.error(f"Telegram file send error: {e}")
+
+
+# ----------------------------
+# Generic Helpers
+# ----------------------------
+def ensure_dir(path: str):
+    """Ensure directory exists."""
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def timestamp():
+    """Return current timestamp string."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_float(val, default=0.0):
+    """Convert to float safely."""
+    try:
+        return float(val)
+    except Exception:
+        return default

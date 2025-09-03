@@ -3,69 +3,104 @@ Execution Engine
 ----------------
 - Places orders via broker
 - Handles retries, slippage control, and iceberg orders
-- Central point for trade execution
+- Integrates with Risk Manager + Circuit Breaker
 """
 
 import time
+import logging
+from core.risk_manager import AdvancedRiskManager
+from core.circuit_breaker import CircuitBreaker
 
 
 class ExecutionEngine:
-    def __init__(self, broker, max_retries=3, sleep_between_retries=2):
+    def __init__(self, broker, risk_manager=None, circuit_breaker=None,
+                 max_retries=3, sleep_between_retries=2, slippage=0.001):
         """
-        broker: Broker object (core/broker.py)
-        max_retries: number of times to retry failed order
+        Args:
+            broker: Broker object (core/broker.py)
+            risk_manager: AdvancedRiskManager instance
+            circuit_breaker: CircuitBreaker instance
+            max_retries: Number of retries for failed orders
+            sleep_between_retries: Delay between retries (sec)
+            slippage: Slippage tolerance (fraction, e.g. 0.001 = 0.1%)
         """
         self.broker = broker
+        self.risk_manager = risk_manager or AdvancedRiskManager()
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.max_retries = max_retries
         self.sleep_between_retries = sleep_between_retries
+        self.slippage = slippage
+        self.last_order_time = None
+        self.logger = logging.getLogger("ExecutionEngine")
 
-    # -------------------------------
-    # Core Execution
-    # -------------------------------
-    def execute_trade(self, symbol, qty, direction="BUY", price=None, iceberg_size=None):
-        """
-        Execute a trade with retry and optional iceberg splitting
-        """
-        if iceberg_size and qty > iceberg_size:
-            return self._execute_iceberg(symbol, qty, direction, price, iceberg_size)
+    def _apply_slippage(self, price, action):
+        """Adjust order price for slippage."""
+        if action == "BUY":
+            return price * (1 + self.slippage)
+        elif action == "SELL":
+            return price * (1 - self.slippage)
+        return price
 
-        return self._place_with_retry(symbol, qty, direction, price)
+    def place_order(self, trade, account_equity=100000, position_size=0):
+        """
+        Place an order with retries and risk checks.
 
-    def _place_with_retry(self, symbol, qty, direction, price):
+        Args:
+            trade (dict): Trade order {symbol, qty, action, strike, is_call, expiry}
+            account_equity (float): Current account equity
+            position_size (int): Current open position size
+
+        Returns:
+            dict: Order response or failure reason
         """
-        Place order with retries
-        """
+        # Risk checks before placing
+        pnl = trade.get("pnl", 0)
+        safe, reason = self.risk_manager.check_risk(account_equity, pnl, position_size)
+        if not safe:
+            self.logger.error(f"❌ Risk Check Failed: {reason}")
+            return {"status": "REJECTED", "reason": reason}
+
+        cb_status = self.circuit_breaker.check(account_equity, pnl)
+        if cb_status != "OK":
+            self.logger.error(f"❌ Circuit Breaker Triggered: {cb_status}")
+            return {"status": "REJECTED", "reason": cb_status}
+
+        symbol = trade["symbol"]
+        qty = trade["qty"]
+        action = trade["action"]
+        price = trade.get("price")  # optional
+        if price:
+            price = self._apply_slippage(price, action)
+
+        order = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self.broker.place_order(symbol, qty, direction, price)
-                if response.get("status") == "success":
-                    print(f"✅ Order successful: {response}")
-                    return response
+                order = self.broker.place_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side=action,
+                    price=price,
+                    product=trade.get("product", "MIS"),
+                    order_type=trade.get("order_type", "MARKET"),
+                )
+                self.logger.info(f"✅ Order Placed: {action} {qty} {symbol} at {price or 'MKT'}")
+                return {"status": "FILLED", "order": order}
+
             except Exception as e:
-                print(f"❌ Order attempt {attempt} failed: {e}")
-                time.sleep(self.sleep_between_retries)
+                self.logger.error(f"⚠️ Order attempt {attempt} failed: {e}")
+                if attempt < self.max_retries:
+                    time.sleep(self.sleep_between_retries)
+                else:
+                    return {"status": "FAILED", "reason": str(e)}
 
-        return {"status": "error", "message": f"Failed after {self.max_retries} attempts"}
+        return {"status": "FAILED", "reason": "Unknown error"}
 
-    # -------------------------------
-    # Iceberg Orders
-    # -------------------------------
-    def _execute_iceberg(self, symbol, qty, direction, price, iceberg_size):
-        """
-        Split a large order into smaller chunks
-        """
-        print(f"🧊 Executing iceberg order: {qty} in chunks of {iceberg_size}")
-
-        responses = []
-        chunks = qty // iceberg_size
-        remainder = qty % iceberg_size
-
-        for i in range(chunks):
-            resp = self._place_with_retry(symbol, iceberg_size, direction, price)
-            responses.append(resp)
-
-        if remainder > 0:
-            resp = self._place_with_retry(symbol, remainder, direction, price)
-            responses.append(resp)
-
-        return responses
+    def cancel_order(self, order_id):
+        """Cancel an order safely."""
+        try:
+            result = self.broker.cancel_order(order_id)
+            self.logger.info(f"🛑 Order cancelled: {order_id}")
+            return result
+        except Exception as e:
+            self.logger.error(f"❌ Failed to cancel order {order_id}: {e}")
+            return None

@@ -1,50 +1,54 @@
+"""
+RL Allocator Callback
+---------------------
+- Tracks Sharpe & Max Drawdown during PPO training
+- Logs metrics to TensorBoard
+- Auto-saves best checkpoint
+- Optional Telegram alerts
+"""
+
 import os
 import numpy as np
 from stable_baselines3.common.callbacks import BaseCallback
+from backtesting.metrics import _calc_sharpe, _calc_max_drawdown
+from core.utils import send_telegram_message
 
 
 class AllocatorMetricsCallback(BaseCallback):
-    """
-    PPO Callback for:
-    - Logging Sharpe & Max Drawdown to TensorBoard
-    - Auto-saving best model checkpoints
-    """
-
-    def __init__(self, save_path="checkpoints", verbose=0):
+    def __init__(self, save_path="checkpoints", verbose=0, telegram=False):
         super(AllocatorMetricsCallback, self).__init__(verbose)
         self.returns = []
         self.equity_curve = []
         self.best_sharpe = -np.inf
         self.save_path = save_path
+        self.telegram = telegram
         os.makedirs(save_path, exist_ok=True)
 
     def _on_step(self) -> bool:
-        if "returns" in self.locals:
-            step_returns = self.locals["returns"]
-            if isinstance(step_returns, (list, np.ndarray)):
-                self.returns.extend(step_returns)
+        # Log reward as return
+        reward = self.locals.get("rewards", [0])[-1]
+        self.returns.append(reward)
 
-        if len(self.returns) > 20:
-            mean_ret = np.mean(self.returns)
-            std_ret = np.std(self.returns) + 1e-8
-            sharpe = mean_ret / std_ret
+        # Track equity (cumulative)
+        equity = sum(self.returns)
+        self.equity_curve.append(equity)
 
-            equity = (self.equity_curve[-1] if self.equity_curve else 1.0) * (1 + self.returns[-1])
-            self.equity_curve.append(equity)
-            peak = np.maximum.accumulate(self.equity_curve)
-            drawdowns = (self.equity_curve - peak) / peak
-            max_dd = drawdowns.min()
+        # Compute metrics
+        sharpe = _calc_sharpe(np.array(self.returns)) if len(self.returns) > 2 else 0
+        dd = _calc_max_drawdown(np.array(self.equity_curve)) if len(self.equity_curve) > 2 else 0
 
-            # Log metrics
-            self.logger.record("allocator/sharpe", sharpe)
-            self.logger.record("allocator/max_drawdown", max_dd)
+        # Log to TensorBoard
+        self.logger.record("allocator/sharpe", sharpe)
+        self.logger.record("allocator/max_drawdown", dd)
 
-            # Checkpoint if Sharpe improved
-            if sharpe > self.best_sharpe:
-                self.best_sharpe = sharpe
-                checkpoint_path = os.path.join(self.save_path, f"allocator_best_{self.num_timesteps}.zip")
-                self.model.save(checkpoint_path)
-                if self.verbose > 0:
-                    print(f"💾 New best Sharpe {sharpe:.2f} at step {self.num_timesteps}, saved {checkpoint_path}")
+        # Save best model
+        if sharpe > self.best_sharpe:
+            self.best_sharpe = sharpe
+            save_file = os.path.join(self.save_path, "best_model")
+            self.model.save(save_file)
+            if self.verbose > 0:
+                print(f"💾 New best model saved @ {save_file} (Sharpe={sharpe:.2f})")
+            if self.telegram:
+                send_telegram_message(f"🤖 New best RL Allocator model! Sharpe={sharpe:.2f}")
 
         return True
