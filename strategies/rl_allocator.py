@@ -1,60 +1,86 @@
 import os
-import random
 import numpy as np
-from stable_baselines3 import PPO
-from strategies.rl_allocator_env import RLAllocatorEnv
+from stable_baselines3.common.callbacks import BaseCallback
 
 
-class RLAllocator:
-    def __init__(self, asset_strategies, multi_asset_returns, greek_exposures,
-                 model_path="models/best_allocator_strike_expiry",
-                 strikes=[-200, 0, 200], expiries=["weekly", "monthly"],
-                 window_size=30):
-        self.asset_strategies = asset_strategies
-        self.multi_asset_returns = multi_asset_returns
-        self.greek_exposures = greek_exposures
-        self.window_size = window_size
-        self.strikes = strikes
-        self.expiries = expiries
+class AllocatorMetricsCallback(BaseCallback):
+    """
+    PPO Callback for RL Allocator:
+    - Logs Sharpe ratio & Max Drawdown
+    - Logs equity, drawdown, margin usage to TensorBoard
+    - Auto-saves best model checkpoints
+    """
 
-        # Env used for inference
-        self.env = RLAllocatorEnv(asset_strategies, strikes, expiries)
+    def __init__(self, save_path="checkpoints", verbose=0):
+        super(AllocatorMetricsCallback, self).__init__(verbose)
+        self.save_path = save_path
+        os.makedirs(save_path, exist_ok=True)
 
-        # Check if model exists
-        model_file = model_path + ".zip"
-        if not os.path.exists(model_file):
-            print(f"⚠️ RL model not found at {model_file}, using random allocator instead")
-            self.model = None
-            self.obs = None
-        else:
-            self.model = PPO.load(model_path)
-            self.obs = self.env.reset()
+        # Tracking
+        self.returns = []
+        self.equity_curve = []
+        self.drawdown_history = []
+        self.margin_history = []
 
-    def choose_action(self):
-        """Predict next action = (strategy, strike_offset, expiry).
-        Falls back to random if no model is available.
-        """
-        if self.model is None:
-            # fallback: pick random strategy/strike/expiry
-            strategy = random.choice(self.asset_strategies)
-            strike_offset = random.choice(self.strikes)
-            expiry = random.choice(self.expiries)
-            return {
-                "strategy": strategy,
-                "strike_offset": strike_offset,
-                "expiry": expiry
-            }
+        self.best_sharpe = -np.inf
+        self.peak_equity = None
 
-        # RL agent prediction
-        action, _ = self.model.predict(self.obs, deterministic=True)
-        strategy_idx, strike_idx, expiry_idx = action
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        if not infos:
+            return True
 
-        strategy = self.asset_strategies[strategy_idx]
-        strike_offset = self.env.strikes[strike_idx]
-        expiry = self.env.expiries[expiry_idx]
+        for info in infos:
+            if "equity" in info:
+                equity = float(info["equity"])
+                margin = float(info.get("margin_used", 0))
 
-        return {
-            "strategy": strategy,
-            "strike_offset": strike_offset,
-            "expiry": expiry
-        }
+                self.equity_curve.append(equity)
+                self.margin_history.append(margin)
+
+                # Peak equity + drawdown tracking
+                if self.peak_equity is None:
+                    self.peak_equity = equity
+                self.peak_equity = max(self.peak_equity, equity)
+                drawdown = self.peak_equity - equity
+                self.drawdown_history.append(drawdown)
+
+                # Compute rolling returns for Sharpe
+                if len(self.equity_curve) > 1:
+                    ret = equity - self.equity_curve[-2]
+                    self.returns.append(ret)
+
+                # Log to TensorBoard
+                self.logger.record("custom/equity", equity)
+                self.logger.record("custom/drawdown", drawdown)
+                self.logger.record("custom/margin", margin)
+
+        # Periodically evaluate performance
+        if len(self.returns) > 30:  # after ~30 steps
+            sharpe = self._compute_sharpe(self.returns)
+            max_dd = max(self.drawdown_history) if self.drawdown_history else 0
+
+            self.logger.record("custom/sharpe", sharpe)
+            self.logger.record("custom/max_drawdown", max_dd)
+
+            # Save best checkpoint
+            if sharpe > self.best_sharpe:
+                self.best_sharpe = sharpe
+                model_path = os.path.join(self.save_path, "best_model")
+                self.model.save(model_path)
+                if self.verbose > 0:
+                    print(f"💾 New best model saved at {model_path} (Sharpe={sharpe:.2f})")
+
+        return True
+
+    def _compute_sharpe(self, returns, risk_free=0.0):
+        returns = np.array(returns)
+        if returns.std() == 0:
+            return -np.inf
+        return (returns.mean() - risk_free) / (returns.std() + 1e-8)
+
+    def _on_training_end(self) -> None:
+        if self.verbose > 0 and self.equity_curve:
+            final_equity = self.equity_curve[-1]
+            max_dd = max(self.drawdown_history) if self.drawdown_history else 0
+            print(f"📊 Training complete | Final Equity={final_equity:.2f} | MaxDD={max_dd:.2f}")

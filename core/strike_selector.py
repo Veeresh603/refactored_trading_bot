@@ -1,8 +1,9 @@
 """
-Strike Selector with Zerodha Kite Option Chain
-----------------------------------------------
+Strike Selector with Adaptive Logic
+-----------------------------------
 - Dynamically selects ATM/ITM/OTM strikes
 - Uses volume + OI filters for liquidity
+- Adapts based on implied volatility and market trend
 - Requires broker.kite.instruments("NFO") loaded once
 """
 
@@ -17,74 +18,71 @@ class StrikeSelector:
         self.min_volume = min_volume
         self.min_oi = min_oi
 
-        # Cache all NFO instruments
-        self.instruments = broker.kite.instruments("NFO")
-
-    def get_nearest_expiry(self, asset):
-        """Pick nearest expiry available for the given asset"""
-        expiries = sorted({inst["expiry"] for inst in self.instruments if inst["name"] == asset})
-        today = date.today()
-        for e in expiries:
-            if e >= today:
-                return e.strftime("%Y-%m-%d")
-        return expiries[0].strftime("%Y-%m-%d")
-
-    def get_strike(self, spot_price, signal, step=50):
-        atm = round(spot_price / step) * step
-        if signal == "BUY":
-            return atm + step
-        elif signal == "SELL":
-            return atm - step
-        else:
-            return atm
-
-    def _fetch_option_chain(self, asset, expiry):
-        """Filter NFO instruments for given asset + expiry"""
-        option_chain = [
-            inst for inst in self.instruments
-            if inst["name"] == asset and str(inst["expiry"]) == expiry
-        ]
-        return option_chain
-
-    def select_option(self, asset, spot_price, signal):
-        """Select the most liquid option contract"""
-        expiry = self.get_nearest_expiry(asset)
-        strike = self.get_strike(spot_price, signal)
-        option_type = "CE" if signal == "BUY" else "PE"
-
-        # Get contracts for this asset + expiry
-        option_chain = self._fetch_option_chain(asset, expiry)
-
-        # Candidate strikes around ATM ± 2 steps
-        candidate_strikes = [strike - 100, strike - 50, strike, strike + 50, strike + 100]
-
-        # Filter contracts
-        candidates = [
-            o for o in option_chain
-            if o["strike"] in candidate_strikes and o["instrument_type"] == option_type
+    def _filter_liquid_strikes(self, option_chain, expiry):
+        """Filter strikes by liquidity (volume & OI)."""
+        return [
+            opt for opt in option_chain
+            if opt["expiry"] == expiry
+            and opt["volume"] >= self.min_volume
+            and opt["oi"] >= self.min_oi
         ]
 
-        if not candidates:
-            # fallback ATM
-            return f"{asset}{expiry}{strike}{option_type}"
+    def _get_atm_strike(self, spot, step=50):
+        """Round to nearest ATM strike."""
+        return round(spot / step) * step
 
-        # Fetch LTP, OI, Volume for candidates
-        tokens = [c["instrument_token"] for c in candidates]
-        ltp_data = self.broker.kite.ltp(tokens)
+    def select_strikes(self, asset, spot, iv, expiry, step=50, trend="neutral"):
+        """
+        Adaptive strike selection.
 
-        liquid = []
-        for c in candidates:
-            token = c["instrument_token"]
-            info = ltp_data.get(str(token), {})
-            oi = info.get("oi", 0)
-            volume = info.get("volume", 0)
-            if volume >= self.min_volume and oi >= self.min_oi:
-                liquid.append((c, volume, oi))
+        Args:
+            asset (str): Asset name (e.g., NIFTY, BANKNIFTY)
+            spot (float): Current spot price
+            iv (float): Implied volatility (0.2 = 20%)
+            expiry (date): Expiry date
+            step (int): Strike step (default 50)
+            trend (str): "bullish", "bearish", or "neutral"
 
-        if not liquid:
-            # fallback ATM CE/PE
-            return candidates[0]["tradingsymbol"]
+        Returns:
+            dict: Selected call/put strikes
+        """
+        atm = self._get_atm_strike(spot, step)
 
-        # Pick most liquid by volume*OI
-        best = max(liquid, key=lambda x: x[1] * x[2])
-        return best[0]["tradingsymbol"]
+        # --- Adaptive logic ---
+        if iv > 0.25:  # High volatility → safer OTM
+            call_strike = atm + step
+            put_strike = atm - step
+        elif iv < 0.15:  # Very low IV → ATM
+            call_strike, put_strike = atm, atm
+        else:  # Moderate IV → slightly OTM
+            call_strike, put_strike = atm + step, atm
+
+        # Trend adjustment
+        if trend == "bullish":
+            call_strike += step  # more OTM calls
+        elif trend == "bearish":
+            put_strike -= step  # more OTM puts
+
+        # --- Fetch option chain ---
+        option_chain = self.broker.get_option_chain(asset)
+        liquid_options = self._filter_liquid_strikes(option_chain, expiry)
+
+        # Pick closest strikes available in chain
+        selected_call = min(
+            (opt for opt in liquid_options if opt["type"] == "CE"),
+            key=lambda x: abs(x["strike"] - call_strike),
+            default=None,
+        )
+        selected_put = min(
+            (opt for opt in liquid_options if opt["type"] == "PE"),
+            key=lambda x: abs(x["strike"] - put_strike),
+            default=None,
+        )
+
+        return {
+            "call": selected_call,
+            "put": selected_put,
+            "atm": atm,
+            "iv": iv,
+            "trend": trend,
+        }

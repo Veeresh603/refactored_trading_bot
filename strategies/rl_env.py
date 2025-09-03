@@ -1,11 +1,22 @@
+"""
+RL Environment (Gym-Compatible)
+-------------------------------
+- Wraps OHLCV data for RL training
+- Features: RSI, MACD, Moving Averages
+- Actions: Buy, Sell, Hold
+- Rewards: PnL-based
+- Integrated with AdvancedRiskManager
+"""
+
 import gymnasium as gym
 from gym import spaces
 import numpy as np
 import pandas as pd
+from core.risk_manager import AdvancedRiskManager
 
 
 def add_indicators(df):
-    """Add technical indicators to the OHLCV dataframe."""
+    """Add RSI, MACD, and Moving Averages to dataframe."""
     df = df.copy()
 
     # RSI (14)
@@ -21,94 +32,91 @@ def add_indicators(df):
     df["macd"] = exp1 - exp2
     df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
 
-    # ATR (14)
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift()).abs()
-    low_close = (df["low"] - df["close"].shift()).abs()
-    tr = high_low.to_frame().join(high_close).join(low_close).max(axis=1)
-    df["atr"] = tr.rolling(14).mean()
+    # Moving Averages
+    df["sma20"] = df["close"].rolling(20).mean()
+    df["sma50"] = df["close"].rolling(50).mean()
 
-    # Drop NaNs
-    df = df.dropna().reset_index(drop=True)
+    df = df.fillna(method="bfill")
     return df
 
 
-class TradingEnv(gym.Env):
-    """
-    Custom Trading Environment for RL (discrete actions)
-    Actions: 0=HOLD, 1=BUY, 2=SELL
-    Observation: last N candles (OHLCV + indicators)
-    Reward: PnL changes
-    """
-
+class RLTradingEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
 
-    def __init__(self, df, window_size=30, initial_balance=100000):
-        super(TradingEnv, self).__init__()
+    def __init__(self, df, initial_balance=100000, window_size=30):
+        super(RLTradingEnv, self).__init__()
 
-        # Add indicators
-        df = add_indicators(df)
-        self.df = df.reset_index(drop=True)
-
+        self.df = add_indicators(df)
+        self.prices = self.df["close"].values
+        self.features = self.df.drop(columns=["time"]).values
         self.window_size = window_size
         self.initial_balance = initial_balance
 
-        # Spaces
-        self.action_space = spaces.Discrete(3)  # HOLD, BUY, SELL
+        # Action space: 0=Hold, 1=Buy, 2=Sell
+        self.action_space = spaces.Discrete(3)
+
+        # Observation space: window of features
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(window_size, self.df.shape[1]), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(window_size, self.features.shape[1]), dtype=np.float32
         )
 
-        # State
-        self.balance = initial_balance
-        self.position = 0  # +1 = long, -1 = short, 0 = flat
-        self.entry_price = 0
-        self.current_step = window_size
+        self.risk_manager = AdvancedRiskManager()
+        self.reset()
 
-    def _get_observation(self):
-        return self.df.iloc[self.current_step - self.window_size:self.current_step].values
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.balance = self.initial_balance
+        self.equity = self.initial_balance
+        self.position = 0
+        self.current_step = self.window_size
+        self.trades = []
+        obs = self._get_observation()
+        return obs, {}
 
     def step(self, action):
-        price = self.df.iloc[self.current_step]["close"]
+        price = self.prices[self.current_step]
         reward = 0
+        done = False
+        info = {}
 
-        # HOLD
-        if action == 0:
-            pass
-
-        # BUY
-        elif action == 1:
-            if self.position == 0:
+        # --- Execute Action ---
+        if action == 1:  # Buy
+            if self.position <= 0:
                 self.position = 1
-                self.entry_price = price
-            elif self.position == -1:  # closing short
-                reward = self.entry_price - price
-                self.balance += reward
-                self.position = 0
-
-        # SELL
-        elif action == 2:
-            if self.position == 0:
+        elif action == 2:  # Sell
+            if self.position >= 0:
                 self.position = -1
-                self.entry_price = price
-            elif self.position == 1:  # closing long
-                reward = price - self.entry_price
-                self.balance += reward
-                self.position = 0
 
+        # --- PnL ---
+        next_price = self.prices[self.current_step + 1] if self.current_step + 1 < len(self.prices) else price
+        pnl = (next_price - price) * self.position
+        self.equity += pnl
+        reward = pnl
+
+        # --- Risk Check ---
+        safe, reason = self.risk_manager.check_risk(self.equity, pnl, abs(self.position))
+        if not safe:
+            done = True
+            info["risk_triggered"] = reason
+
+        # --- Log Trade ---
+        self.trades.append(
+            {"step": self.current_step, "action": action, "price": price, "pnl": pnl, "equity": self.equity}
+        )
+
+        # --- Advance ---
         self.current_step += 1
-        done = self.current_step >= len(self.df) - 1
+        if self.current_step >= len(self.prices) - 1:
+            done = True
+
         obs = self._get_observation()
+        info["equity"] = self.equity
+        return obs, reward, done, False, info
 
-        return obs, reward, done, {}
-
-    def reset(self):
-        self.balance = self.initial_balance
-        self.position = 0
-        self.entry_price = 0
-        self.current_step = self.window_size
-        return self._get_observation()
+    def _get_observation(self):
+        start = self.current_step - self.window_size
+        obs = self.features[start:self.current_step]
+        return obs.astype(np.float32)
 
     def render(self, mode="human"):
-        print(f"Step: {self.current_step}, Balance: {self.balance}, Position: {self.position}")
+        print(f"Step={self.current_step}, Equity={self.equity:.2f}, Position={self.position}")

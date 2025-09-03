@@ -1,5 +1,4 @@
 import gymnasium as gym
-from gym import spaces
 import numpy as np
 
 class RLAllocatorEnv(gym.Env):
@@ -11,14 +10,14 @@ class RLAllocatorEnv(gym.Env):
         self.expiries = expiries
 
         # Action space: [strategy, strike offset, expiry type]
-        self.action_space = spaces.MultiDiscrete([
+        self.action_space = gym.spaces.MultiDiscrete([
             len(asset_strategies),
             len(strikes),
             len(expiries)
         ])
 
         # Observations = [returns, volatility, Greeks, etc.]
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32)
 
         self.t = 0
 
