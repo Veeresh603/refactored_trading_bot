@@ -4,39 +4,27 @@
 
 namespace py = pybind11;
 
-// Expose ExecutionEngine singleton instance to Python
-PYBIND11_MODULE(execution_cpp, m) {
-    m.doc() = "C++ Execution Engine for Trading (PyBind11)";
+PYBIND11_MODULE(execution_engine_cpp, m) {
+    m.doc() = "C++ ExecutionEngine (premium-based PnL, FIFO realized, per-contract Greeks)";
 
-    // Place Order
-    m.def("place_order", [](const std::string& symbol, int qty, double price,
-                            double strike, double sigma, bool is_call, double expiry_days) {
-        engine.place_order(symbol, qty, price, strike, sigma, is_call, expiry_days);
-    });
+    py::class_<Position>(m, "Position")
+        .def_readonly("symbol",       &Position::symbol)
+        .def_readonly("qty",          &Position::qty)
+        .def_readonly("strike",       &Position::strike)
+        .def_readonly("sigma",        &Position::sigma)
+        .def_readonly("is_call",      &Position::is_call)
+        .def_readonly("expiry_days",  &Position::expiry_days)
+        .def_readonly("entry_price",  &Position::entry_price)
+        .def_readonly("realized_pnl", &Position::realized_pnl)
+        .def_readonly("unrealized_pnl",&Position::unrealized_pnl);
 
-    // Account Status
-    m.def("account_status", [](double spot) {
-        return engine.account_status(spot);
-    });
-
-    // Portfolio Greeks
-    m.def("portfolio_greeks", [](double spot) {
-        auto [delta, gamma, vega, theta] = engine.portfolio_greeks(spot);
-        return std::unordered_map<std::string,double>{
-            {"delta", delta},
-            {"gamma", gamma},
-            {"vega", vega},
-            {"theta", theta}
-        };
-    });
-
-    // Trade Log
-    m.def("get_trade_log", []() {
-        return engine.get_trade_log();
-    });
-
-    // Reset
-    m.def("reset_engine", [](double balance) {
-        engine.reset(balance);
-    });
+    py::class_<ExecutionEngine>(m, "ExecutionEngine")
+        .def(py::init<>())
+        .def("reset",                 &ExecutionEngine::reset)
+        .def("place_order",           &ExecutionEngine::place_order)
+        .def("account_status",        &ExecutionEngine::account_status)
+        .def("portfolio_greeks",      &ExecutionEngine::portfolio_greeks)
+        .def("get_positions",         &ExecutionEngine::get_positions,
+                                       py::return_value_policy::reference_internal)
+        .def("get_positions_with_pnl",&ExecutionEngine::get_positions_with_pnl);
 }

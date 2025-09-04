@@ -21,8 +21,11 @@ trading:
   initial_balance: 100000
   instruments: [256265, 260105]  # NIFTY=256265, BANKNIFTY=260105
   poll_interval: 5             # seconds between data fetch
+  paper_lot_size: 50
 
 market:
+  # open: "00:00:00" # "09:15:00"
+  # close: "23:59:59" # "15:30:00"
   open: "09:15:00"
   close: "15:30:00"
 
@@ -37,12 +40,15 @@ logging:
 # Risk Manager + Circuit Breaker
 # ============================
 risk:
-  max_position_size: 500
-  max_daily_loss: 5000
-  max_drawdown: 0.2
-  max_consecutive_losses: 5
-  stop_on_loss: true
-  cool_off_minutes: 15
+  max_position_size: 250      # max 5 lots (5×50 = 250 contracts)
+  max_daily_loss: -50000        # allow up to ₹50k drawdown before stop
+  max_drawdown: -30000          # 30% of capital
+  max_consecutive_losses: 10    # more forgiving
+  stop_on_loss: false           # don’t instantly stop whole bot
+  cool_off_minutes: 5           # short cool-off for testing
+  max_short_lots: 10        # 🚀 NEW → cap on SELL/short exposure
+
+
 
 # ============================
 # Execution Engine

@@ -1,86 +1,88 @@
-import os
+"""
+RL Allocator
+------------
+- Reinforcement Learning policy allocator (PPO)
+- Chooses strategy, strike offset, and expiry
+- Returns standardized decision dict for StrategyEngine
+"""
+
+import logging
 import numpy as np
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3 import PPO
+
+logger = logging.getLogger("RLAllocator")
 
 
-class AllocatorMetricsCallback(BaseCallback):
-    """
-    PPO Callback for RL Allocator:
-    - Logs Sharpe ratio & Max Drawdown
-    - Logs equity, drawdown, margin usage to TensorBoard
-    - Auto-saves best model checkpoints
-    """
+class RLAllocator:
+    def __init__(self, asset_strategies, multi_asset_returns, greek_exposures,
+                 model_path="models/best_allocator_strike_expiry",
+                 strikes=[-100, 0, 100], expiries=["weekly", "monthly"],
+                 window_size=30):
+        """
+        Args:
+            asset_strategies (list): list of strategies (tuples or names)
+            multi_asset_returns (dict): recent returns
+            greek_exposures (dict): portfolio Greeks
+            model_path (str): saved PPO model
+            strikes (list): strike offsets to choose from
+            expiries (list): expiry choices
+            window_size (int): lookback window
+        """
+        self.asset_strategies = asset_strategies
+        self.multi_asset_returns = multi_asset_returns
+        self.greek_exposures = greek_exposures
+        self.model_path = model_path
+        self.strikes = strikes
+        self.expiries = expiries
+        self.window_size = window_size
 
-    def __init__(self, save_path="checkpoints", verbose=0):
-        super(AllocatorMetricsCallback, self).__init__(verbose)
-        self.save_path = save_path
-        os.makedirs(save_path, exist_ok=True)
+        try:
+            self.model = PPO.load(model_path)
+            logger.info(f"🤖 RLAllocator model loaded from {model_path}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not load PPO model: {e}")
+            self.model = None
 
-        # Tracking
-        self.returns = []
-        self.equity_curve = []
-        self.drawdown_history = []
-        self.margin_history = []
+    def choose_action(self):
+        """
+        Pick action using PPO policy or fallback to random.
 
-        self.best_sharpe = -np.inf
-        self.peak_equity = None
+        Returns:
+            dict with keys:
+                - strategy (str)
+                - signal (int: 1=Buy Call, -1=Buy Put, 0=Hold)
+                - strike_offset (int)
+                - expiry (str)
+        """
+        if self.model is None:
+            # fallback to random if model not loaded
+            strategy = np.random.choice(self.asset_strategies)
+            strike_offset = int(np.random.choice(self.strikes))
+            expiry = str(np.random.choice(self.expiries))
+            signal = np.random.choice([1, -1, 0])
+            return {"strategy": "RLAllocator", "signal": signal,
+                    "strike_offset": strike_offset, "expiry": expiry}
 
-    def _on_step(self) -> bool:
-        infos = self.locals.get("infos", [])
-        if not infos:
-            return True
+        # --- Build observation (very simplified) ---
+        obs = np.array([np.mean(list(self.multi_asset_returns.values())) or 0.0,
+                        self.greek_exposures.get("delta", 0.0),
+                        self.greek_exposures.get("gamma", 0.0),
+                        self.greek_exposures.get("vega", 0.0)])
 
-        for info in infos:
-            if "equity" in info:
-                equity = float(info["equity"])
-                margin = float(info.get("margin_used", 0))
+        action, _ = self.model.predict(obs, deterministic=True)
 
-                self.equity_curve.append(equity)
-                self.margin_history.append(margin)
+        # Decode action (assuming discrete space: strategy, strike, expiry, signal)
+        strategy_idx = action[0] % len(self.asset_strategies)
+        strike_idx = action[1] % len(self.strikes)
+        expiry_idx = action[2] % len(self.expiries)
+        signal_val = 1 if action[3] > 0 else -1 if action[3] < 0 else 0
 
-                # Peak equity + drawdown tracking
-                if self.peak_equity is None:
-                    self.peak_equity = equity
-                self.peak_equity = max(self.peak_equity, equity)
-                drawdown = self.peak_equity - equity
-                self.drawdown_history.append(drawdown)
+        decision = {
+            "strategy": "RLAllocator",
+            "signal": signal_val,
+            "strike_offset": self.strikes[strike_idx],
+            "expiry": self.expiries[expiry_idx],
+        }
 
-                # Compute rolling returns for Sharpe
-                if len(self.equity_curve) > 1:
-                    ret = equity - self.equity_curve[-2]
-                    self.returns.append(ret)
-
-                # Log to TensorBoard
-                self.logger.record("custom/equity", equity)
-                self.logger.record("custom/drawdown", drawdown)
-                self.logger.record("custom/margin", margin)
-
-        # Periodically evaluate performance
-        if len(self.returns) > 30:  # after ~30 steps
-            sharpe = self._compute_sharpe(self.returns)
-            max_dd = max(self.drawdown_history) if self.drawdown_history else 0
-
-            self.logger.record("custom/sharpe", sharpe)
-            self.logger.record("custom/max_drawdown", max_dd)
-
-            # Save best checkpoint
-            if sharpe > self.best_sharpe:
-                self.best_sharpe = sharpe
-                model_path = os.path.join(self.save_path, "best_model")
-                self.model.save(model_path)
-                if self.verbose > 0:
-                    print(f"💾 New best model saved at {model_path} (Sharpe={sharpe:.2f})")
-
-        return True
-
-    def _compute_sharpe(self, returns, risk_free=0.0):
-        returns = np.array(returns)
-        if returns.std() == 0:
-            return -np.inf
-        return (returns.mean() - risk_free) / (returns.std() + 1e-8)
-
-    def _on_training_end(self) -> None:
-        if self.verbose > 0 and self.equity_curve:
-            final_equity = self.equity_curve[-1]
-            max_dd = max(self.drawdown_history) if self.drawdown_history else 0
-            print(f"📊 Training complete | Final Equity={final_equity:.2f} | MaxDD={max_dd:.2f}")
+        logger.info(f"RLAllocator decision: {decision}")
+        return decision

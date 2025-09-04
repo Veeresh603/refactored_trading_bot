@@ -17,7 +17,7 @@ import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.logger import configure
-from core import execution_cpp
+from core import execution_engine
 from strategies.rl_allocator_callback import AllocatorMetricsCallback
 
 logger = logging.getLogger("TrainAllocator")
@@ -51,13 +51,13 @@ class AllocatorEnv(gym.Env):
         self.max_drawdown_penalty = max_drawdown_penalty
         self.margin_penalty = margin_penalty
 
-        execution_cpp.reset_engine(self.prev_equity)
+        execution_engine.reset_engine(self.prev_equity)
 
     def reset(self):
         self.current_step = 0
         self.prev_equity = 100000
         self.peak_equity = self.prev_equity
-        execution_cpp.reset_engine(self.prev_equity)
+        execution_engine.reset_engine(self.prev_equity)
         return np.zeros(4, dtype=np.float32)
 
     def step(self, action):
@@ -73,7 +73,7 @@ class AllocatorEnv(gym.Env):
         # Execute trade if signal != flat
         if signal_val != 0:
             strike = round(spot / 50) * 50 + strike_offset
-            execution_cpp.place_order(
+            execution_engine.place_order(
                 symbol=f"NIFTY{strike}{'CE' if signal_val == 1 else 'PE'}",
                 qty=50,
                 price=spot,
@@ -84,7 +84,7 @@ class AllocatorEnv(gym.Env):
             )
 
         # Portfolio update
-        status = execution_cpp.account_status(spot)
+        status = execution_engine.account_status(spot)
         equity = status["balance"] + status["total"]
         margin_used = status.get("margin_used", 0)
 
@@ -99,7 +99,7 @@ class AllocatorEnv(gym.Env):
 
         # --- Update state ---
         self.prev_equity = equity
-        delta, gamma, vega, theta = execution_cpp.portfolio_greeks(spot)
+        delta, gamma, vega, theta = execution_engine.portfolio_greeks(spot)
         obs = np.array([pnl_change / 1000.0, delta, gamma, vega], dtype=np.float32)
 
         done = self.current_step >= self.max_steps

@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import time
-from core import execution_cpp
+from core import execution_engine
 
 # ----------------------------
 # Page setup
@@ -26,13 +26,13 @@ while True:
         spot_price = 20000.0  # replace with live WebSocket
 
         # Account status
-        status = execution_cpp.account_status(spot_price)
+        status = execution_engine.account_status(spot_price)
 
         # Greeks
-        delta, gamma, vega, theta = execution_cpp.portfolio_greeks(spot_price)
+        delta, gamma, vega, theta = execution_engine.portfolio_greeks(spot_price)
 
-        # Get live trade history from execution_cpp
-        trade_df = execution_cpp.get_trade_history(limit=10)
+        # Get live trade history from execution_engine
+        trade_df = execution_engine.get_trade_history(limit=10)
 
         # ----------------------------
         # Metrics Row

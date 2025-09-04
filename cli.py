@@ -12,6 +12,7 @@ import argparse
 import logging
 import pandas as pd
 import os
+import subprocess
 from glob import glob
 
 from backtesting.backtest import Backtester
@@ -109,6 +110,11 @@ def run_train(train_mode: str, epochs: int, timesteps: int):
         print(f"📂 Final Model: {save_path}")
         print(f"📂 Best Checkpoints: {checkpoint_dir}")
 
+        try:
+            send_telegram_message("✅ RL Allocator training complete.")
+        except Exception as e:
+            logger.warning(f"Telegram send failed: {e}")
+
     else:
         raise ValueError(f"❌ Unknown training mode: {train_mode}")
 
@@ -139,7 +145,8 @@ def main():
     elif args.mode == "train":
         run_train(args.train_mode, args.epochs, args.timesteps)
     elif args.mode == "live":
-        print("🚧 Live trading handled via main.py")
+        logger.info("🚀 Launching live trading via main.py")
+        subprocess.run(["python", "main.py"])
 
 
 if __name__ == "__main__":

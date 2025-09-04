@@ -4,7 +4,7 @@ from datetime import datetime
 
 from strategies.rl_allocator import RLAllocator
 from strategies.options_optimizer import OptionsOptimizer
-from core import execution_cpp
+from core import execution_engine
 from core.fees import get_fees   # ✅ Broker fee model
 
 # ----------------------------
@@ -70,7 +70,7 @@ for i, row in df.iterrows():
     logger.info(f"{row['date']} → RL chose {strategy}, strike_offset={strike_offset}, expiry={expiry_type}")
 
     # Build contract
-    delta, gamma, vega, theta = execution_cpp.portfolio_greeks(spot)
+    delta, gamma, vega, theta = execution_engine.portfolio_greeks(spot)
     greeks = {"delta": delta, "gamma": gamma, "vega": vega}
 
     contract = options_optimizer.build_option_contract(
@@ -87,7 +87,7 @@ for i, row in df.iterrows():
     trade_fee = get_fees(broker_model, trade_price, contract["qty"])
 
     # Simulate execution
-    execution_cpp.place_order(
+    execution_engine.place_order(
         contract["symbol"], contract["qty"], trade_price, "BUY",
         strike=contract["strike"], sigma=iv, is_call=contract["is_call"],
         expiry_days=(contract["expiry"] - row["date"].date()).days
@@ -97,7 +97,7 @@ for i, row in df.iterrows():
     equity -= trade_fee
 
     # Track equity
-    status = execution_cpp.account_status(spot)
+    status = execution_engine.account_status(spot)
     equity = status["balance"] + status["total"]
     pnl_curve.append({"date": row["date"], "equity": equity})
 
