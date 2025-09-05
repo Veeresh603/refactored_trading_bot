@@ -17,7 +17,7 @@ from datetime import datetime
 from collections import deque, defaultdict
 from typing import Dict, List, Optional
 
-from core import execution_engine  # pybind11 module exposing class ExecutionEngine
+from core import execution_engine_cpp as execution_engine  # pybind11 module exposing class ExecutionEngine
 
 logger = logging.getLogger("PaperEngine")
 

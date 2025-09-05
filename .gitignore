@@ -39,6 +39,7 @@ historical_data/
 # Cache
 *.cache
 *.tmp
+*.json
 
 # Build / Dist
 build/
@@ -69,3 +70,4 @@ core/execution_engine.cp*.pyd
 # OS files
 .DS_Store
 Thumbs.db
+.json

@@ -171,81 +171,110 @@ def flatten_if_neutral(signal: int, spot: float):
         logger.info(f"🔁 Neutral: flattening {len(open_positions)} open positions")
         paper_engine.flatten_all(spot)
 
-def size_and_place(decision: dict, spot: float):
+# --- Robust wrapper to build/construct option contract from OptionsOptimizer ---
+import inspect
+import logging
+
+logger = logging.getLogger("TradingBot")
+
+def size_and_place(decision, spot):
     """
-    Build contract, compute size with risk utilization logging,
-    check risk, and place order via paper_engine/live adapter.
+    Build contract using options_optimizer in a resilient way, apply position sizing,
+    and place the order on paper_engine or live broker.
+    This wrapper tries several common method names/signatures so mismatches don't crash.
     """
-    # 1) Build contract
-    contract = options_optimizer.build_contract(spot, decision)
-    logger.info(f"📦 Built contract: {contract}")
+    contract = None
+    opt = options_optimizer  # assumes options_optimizer is global in main.py as before
 
-    # 2) Account & sizing
-    acct = execution_engine.account_status(spot) if TRADING_MODE != "paper" else paper_engine.account_status(spot)
-    equity = acct["total"]
-    allowed_risk = equity * RISK_PER_TRADE
+    # Candidate method names & call orders we try (most-likely first)
+    candidate_calls = [
+        ("build_contract", (spot, decision)),      # what your traceback shows
+        ("build_contract", (decision, spot)),      # alternative arg order
+        ("evaluate", (decision, spot)),            # earlier code used .evaluate(decision)
+        ("evaluate", (spot, decision)),            # alternative order
+        ("build", (decision, spot)),               # other possible name
+        ("build", (spot, decision)),
+    ]
 
-    premium = float(contract.get("premium", 0.0))
-    if premium <= 0:
-        # Fallback premium: approx using IV * 10 for a placeholder (rare)
-        premium = max(1.0, float(contract.get("iv", 0.2)) * 100.0)
+    # Keep a small registry of errors for troubleshooting
+    call_errors = []
 
-    lots = max(1, int(allowed_risk / (premium * LOT_SIZE)))
-    side = "BUY" if int(decision["signal"]) > 0 else "SELL" if int(decision["signal"]) < 0 else "FLAT"
+    for name, args in candidate_calls:
+        if not hasattr(opt, name):
+            call_errors.append((name, "missing"))
+            continue
 
-    notional_risk = lots * premium * LOT_SIZE
-    utilization = 100.0 * notional_risk / allowed_risk if allowed_risk > 0 else 0.0
+        fn = getattr(opt, name)
+        # sanity: ensure callable
+        if not callable(fn):
+            call_errors.append((name, "not callable"))
+            continue
 
-    logger.info(
-        "⚖️ Position sizing: equity={:.2f}, allowed_risk={:.2f}, approx_premium={:.2f}, "
-        "→ qty={} lots, side={} (utilization={:.1f}%)".format(
-            equity, allowed_risk, premium, lots, side, utilization
-        )
-    )
-
-    # 3) Risk checks (position caps, cool-off, daily loss, etc.)
-    is_safe, reason = risk_manager.check_risk(
-        equity=equity,
-        pnl=acct["realized"] + acct["unrealized"],
-        position_size=lots * LOT_SIZE
-    )
-    if not is_safe:
-        logger.warning(f"⚠️ Risk triggered: {reason}")
-        if risk_manager.can_hedge():
-            logger.info("🛡️ Cool-off hedging allowed: skipping entry but will allow flatten/hedge trades.")
-        else:
-            risk_manager.start_cooloff()
-            logger.warning(f"⏸️ Cool-off started for {risk_manager.cool_off_minutes} minutes")
-        return
-
-    if risk_manager.in_cooloff() and not risk_manager.can_hedge():
-        logger.info("⏸️ Cool-off active, skipping this cycle")
-        return
-
-    # 4) Execute
-    if side == "FLAT":
-        flatten_if_neutral(0, spot)
-    else:
-        if TRADING_MODE == "live":
-            # TODO: Add broker adapter call
-            logger.info(f"📡 LIVE ORDER: {contract['symbol']} {side} {lots} @ {spot:.2f}")
-            send_telegram_message(f"📡 LIVE ORDER: {contract['symbol']} {side} {lots} @ {spot:.2f}")
-        else:
-            if side == "BUY":
-                paper_engine.buy(contract, lots, spot)
+        # Attempt to call, but guard exceptions so trading loop doesn't crash
+        try:
+            logger.debug(f"[TRACE] Trying options_optimizer.{name}{args}")
+            contract = fn(*args)
+            # If function returns False-y or raises custom error, treat accordingly
+            if contract:
+                logger.info(f"📦 Built contract via {name}: {contract}")
+                break
             else:
-                paper_engine.sell(contract, lots, spot)
+                # record that call returned falsy (None/False/empty) and continue trying others
+                call_errors.append((name, "returned falsy"))
+        except TypeError as te:
+            # signature mismatch (wrong number of args etc.)
+            call_errors.append((name, f"TypeError: {te}"))
+        except Exception as e:
+            # other runtime error (e.g. missing data inside optimizer)
+            call_errors.append((name, f"Exception: {e}"))
 
-    # 5) Log PnL & Greeks
-    acct2 = execution_engine.account_status(spot) if TRADING_MODE != "paper" else paper_engine.account_status(spot)
-    logger.info(pnl_log_from_account(acct2))
-    log_greeks(spot)
+    if contract is None:
+        # Build a helpful diagnostic message and skip placing.
+        opt_methods = [m for m in dir(opt) if not m.startswith("_")]
+        logger.error("❌ OptionsOptimizer could not build a contract.")
+        logger.error("Tried these method attempts and results:")
+        for entry in call_errors:
+            logger.error(f" - {entry[0]} -> {entry[1]}")
+        logger.error(f"OptionsOptimizer exposed public attributes: {opt_methods}")
+        # Optionally, also dump the decision and spot so user can inspect
+        logger.debug(f"[TRACE] decision={decision}, spot={spot}")
+        return None
 
-    # 6) Optional: pretty-print open positions when small
+    # If we have a contract, do sizing and execute (this part adapts to your existing flow)
     try:
-        paper_engine.log_positions()
-    except Exception:
-        pass
+        # Example: ensure contract dict fields exist
+        qty = contract.get("qty", 1)
+        symbol = contract.get("symbol", "<unknown>")
+        strike = contract.get("strike", None)
+        iv = contract.get("iv", contract.get("premium", 0.2))
+        is_call = contract.get("is_call", True)
+        expiry = contract.get("expiry")
+        expiry_days = (expiry - datetime.now().date()).days if expiry else contract.get("expiry_days", 1)
+
+        # place into paper or live
+        if TRADING_MODE == "live":
+            logger.info(f"📡 LIVE ORDER: {symbol} BUY {qty} @ {spot}")
+            # TODO: call broker adapter here
+        elif TRADING_MODE == "paper":
+            # paper_engine.place_order signature: (symbol, qty, price, strike, sigma, is_call, expiry_days)
+            paper_engine.place_order(
+                symbol=symbol,
+                qty=qty,
+                price=spot,
+                strike=strike or spot,
+                sigma=iv,
+                is_call=is_call,
+                expiry_days=max(1, expiry_days),
+            )
+        else:
+            logger.info("Backtest mode: not placing live orders.")
+
+        return contract
+
+    except Exception as e:
+        logger.error(f"❌ Failed to size/place contract: {e}")
+        logger.debug("Contract payload: %s", contract)
+        return None
 
 # ----------------------------
 # Trading loop

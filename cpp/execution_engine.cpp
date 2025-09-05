@@ -151,3 +151,12 @@ std::vector<Position> ExecutionEngine::get_positions_with_pnl(double spot) {
     }
     return out;
 }
+
+std::vector<std::string> ExecutionEngine::get_trade_log() {
+    std::vector<std::string> log;
+    for (const auto &p : positions) {
+        // If Position has symbol and qty members
+        log.push_back(p.symbol + " x" + std::to_string(p.qty));
+    }
+    return log;
+}

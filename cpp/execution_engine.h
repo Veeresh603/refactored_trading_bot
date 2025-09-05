@@ -42,6 +42,7 @@ public:
 
     // Compute and return positions with refreshed unrealized PnL (premium-based)
     std::vector<Position> get_positions_with_pnl(double spot);
+    std::vector<std::string> get_trade_log();
 };
 
 // Helpers (exposed to cpp only; not required in Python)
