@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from ai.feature_engineer import add_indicators
 from ai.models.lstm import LSTMBrain
 from ai.models.transformer import TransformerModel
-from ai.models.rl_agent import RLAgent
+from ai.models.rl_agent import MLPAgent
 from backtesting.metrics import compute_metrics
 
 

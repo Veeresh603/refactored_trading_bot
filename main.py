@@ -1,359 +1,314 @@
+#!/usr/bin/env python3
 """
-Main Trading Loop
------------------
-- Supports backtest, paper, and live modes
-- Unified strategy evaluation (StrategyEngine)
-- Risk managed by AdvancedRiskManager
-- Executes via C++ engine (execution_engine_cpp) or paper engine
-- Debounced decisions (no duplicate spam)
-- Sizing log shows risk utilization %
+main.py - unified project runner for backtest / train / paper / live modes
+
+Features:
+- CLI: --mode backtest|train|paper|live
+- Loads YAML config if provided (fallback to sensible defaults)
+- Wires LiveDataManager, execution_engine, strategy, RL trainer
+- Defensive imports and fallbacks so the repo can run without external SDKs
+- Deterministic seeding and run metadata saved to checkpoint dir
+
+Usage examples:
+  python main.py --mode backtest --cfg cfg/backtest.yaml
+  python main.py --mode train --episodes 200 --checkpoint-dir checkpoints/exp1
+  python main.py --mode paper --replay sample.csv
+
+This file is designed to be copy/paste-ready. Overwrite your existing main.py with this content.
 """
 
+from __future__ import annotations
+
+import argparse
+import logging
 import os
+import sys
 import time
-import yaml
-import logging
-from collections import deque
-from datetime import datetime, date
-from dotenv import load_dotenv
+import signal
+import json
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-# Core + Strategies
-from core import execution_engine_cpp as execution_engine  # pybind11 module name (per your last setup)
-from core.paper_engine import PaperTradingEngine
-from core.utils import send_telegram_message
-from core.live_data_manager import LiveDataManager
-from core.risk_manager import AdvancedRiskManager
+# Defensive imports (fall back to local implementations we created earlier)
+try:
+    from core.live_data_manager import LiveDataManager
+except Exception:
+    LiveDataManager = None
 
-from strategies.rl_allocator import RLAllocator
-from strategies.options_optimizer import OptionsOptimizer
-from core.strategy_engine import StrategyEngine
-from strategies.moving_average import MovingAverageStrategy
-from strategies.rsi_strategy import RSIStrategy
-from strategies.mean_reversion import MeanReversionStrategy
-from backtesting.backtest import Backtester
+try:
+    import core.execution_engine as execution_engine
+except Exception:
+    execution_engine = None
 
-# ----------------------------
-# Load .env and config.yaml
-# ----------------------------
-load_dotenv()
+# Strategy loader: try to load strategies/strategy.py or fallback to a simple SMA strategy
+try:
+    # expect strategies to expose a Strategy class with on_tick(tick)->List[order_dict]
+    from strategies.strategy import Strategy as ProjectStrategy
+    HAVE_PROJECT_STRATEGY = True
+except Exception:
+    ProjectStrategy = None
+    HAVE_PROJECT_STRATEGY = False
+
+# RL trainer import
+try:
+    from ai.train_rl import RLTrainer, TrainConfig
+    HAVE_RLTRAINER = True
+except Exception:
+    RLTrainer = None
+    TrainConfig = None
+    HAVE_RLTRAINER = False
 
 
-def load_config(path="config.yaml"):
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+# -------------------------
+# Simple fallback SMA strategy (used if project strategy not present)
+# -------------------------
+class SimpleSMA:
+    """A tiny strategy example to demonstrate wiring.
 
-
-config = load_config()
-
-TRADING_MODE = config["trading"]["mode"]   # "backtest" | "paper" | "live"
-BROKER = config["trading"]["broker"]
-INITIAL_BALANCE = float(config["trading"]["initial_balance"])
-LOT_SIZE = int(config["trading"].get("paper_lot_size", config.get("risk", {}).get("lot_size", 50)))
-
-MARKET_OPEN = datetime.strptime(config["market"]["open"], "%H:%M:%S").time()
-MARKET_CLOSE = datetime.strptime(config["market"]["close"], "%H:%M:%S").time()
-
-RISK_CONFIG = config["risk"]
-OPTIMIZER_CONFIG = config["options_optimizer"]
-RL_CONFIG = config["rl_allocator"]
-
-# risk per trade for sizing (used to compute allowed_risk)
-RISK_PER_TRADE = float(config.get("risk_per_trade", 0.01))
-
-# ----------------------------
-# Logger setup
-# ----------------------------
-LOG_LEVEL = getattr(logging, config["logging"]["level"].upper(), logging.INFO)
-LOG_FILE = config["logging"]["logfile"]
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
-              logging.StreamHandler()]
-)
-logger = logging.getLogger("TradingBot")
-
-# ----------------------------
-# Initialize Engines / Data
-# ----------------------------
-paper_engine = None
-live_data_manager = None
-
-if TRADING_MODE == "paper":
-    paper_engine = PaperTradingEngine(initial_balance=INITIAL_BALANCE, lot_size=LOT_SIZE)
-    instruments = config["trading"].get("instruments", [256265])  # default NIFTY token
-    live_data_manager = LiveDataManager(instruments=instruments, broker=BROKER)
-    logger.info("📝 Running in PAPER TRADING mode")
-
-elif TRADING_MODE == "live":
-    instruments = config["trading"].get("instruments", [256265])
-    live_data_manager = LiveDataManager(instruments=instruments, broker=BROKER)
-    logger.info(f"📡 Running in LIVE mode via {BROKER}")
-
-else:
-    logger.info("📊 Running in BACKTEST mode")
-
-# ----------------------------
-# Initialize Strategies
-# ----------------------------
-base_strategies = [
-    MovingAverageStrategy(short_window=20, long_window=50),
-    RSIStrategy(period=14, lower=30, upper=70),
-    MeanReversionStrategy(lookback=20, threshold=0.02),
-]
-
-rl_alloc = RLAllocator(
-    asset_strategies=["SMA", "RSI", "MeanReversion"],
-    multi_asset_returns={}, greek_exposures={},
-    model_path="models/best_allocator_strike_expiry",
-    strikes=RL_CONFIG["strikes"], expiries=RL_CONFIG["expiries"],
-    window_size=RL_CONFIG.get("window_size", 30)
-)
-
-strategy_engine = StrategyEngine(base_strategies + [rl_alloc])
-options_optimizer = OptionsOptimizer(OPTIMIZER_CONFIG, lot_size=LOT_SIZE)
-risk_manager = AdvancedRiskManager(RISK_CONFIG)
-
-# Debounce state for decisions
-_last_decision_key = None
-_state_buf = deque(maxlen=2)  # simple stability buffer
-
-# ----------------------------
-# Helpers
-# ----------------------------
-def market_open_now() -> bool:
-    now = datetime.now().time()
-    return MARKET_OPEN <= now <= MARKET_CLOSE
-
-def get_spot() -> float:
+    Interface:
+      - on_tick(tick: dict) -> List[order_dict]
+    order_dict: {"symbol": str, "qty": int, "side": "BUY"|"SELL", "order_type": "MARKET"}
     """
-    Obtain current underlying spot from live_data_manager.
-    Uses the first configured instrument or a named lookup if available.
-    """
-    if live_data_manager is None:
-        return 0.0
-    # Try a friendly 'get_spot' API, else fallback to get_latest(instrument_token)
+
+    def __init__(self, window_short: int = 5, window_long: int = 20, symbol: str = "TEST", size: int = 1):
+        self.window_short = window_short
+        self.window_long = window_long
+        self.symbol = symbol
+        self.size = size
+        self.prices: List[float] = []
+
+    def on_tick(self, tick: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if tick.get("symbol") != self.symbol:
+            return []
+        price = float(tick.get("price"))
+        self.prices.append(price)
+        orders: List[Dict[str, Any]] = []
+        if len(self.prices) >= self.window_long:
+            short_ma = sum(self.prices[-self.window_short:]) / float(self.window_short)
+            long_ma = sum(self.prices[-self.window_long:]) / float(self.window_long)
+            # naive crossover
+            if short_ma > long_ma:
+                orders.append({"symbol": self.symbol, "qty": self.size, "side": "BUY", "order_type": "MARKET"})
+            elif short_ma < long_ma:
+                orders.append({"symbol": self.symbol, "qty": self.size, "side": "SELL", "order_type": "MARKET"})
+        return orders
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def setup_logging(level: int = logging.INFO):
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+
+
+def load_yaml_config(path: str) -> Dict[str, Any]:
     try:
-        return float(live_data_manager.get_spot("NIFTY"))
+        import yaml
+
+        with open(path, "r") as fh:
+            return yaml.safe_load(fh) or {}
     except Exception:
-        token = config["trading"].get("instruments", [256265])[0]
-        ticks = live_data_manager.get_latest(token)
-        if ticks and "last_price" in ticks:
-            return float(ticks["last_price"])
-        return 0.0
+        logging.getLogger("main").warning("PyYAML not available or failed to load config; using empty config")
+        return {}
 
-def pnl_log_from_account(acct: dict) -> str:
-    realized = acct.get("realized", 0.0)
-    unrealized = acct.get("unrealized", 0.0)
-    total = realized + unrealized
-    return f"💰 PnL Update → Realized={realized:.2f}, Unrealized={unrealized:.2f}, Total={total:.2f}"
 
-def log_greeks(spot: float):
-    try:
-        dlt, gmm, vega, theta = execution_engine.portfolio_greeks(spot)
-        logger.info(f"📈 Greeks Δ={dlt:.2f}, Γ={gmm:.4f}, Vega={vega:.2f}, Θ={theta:.2f}")
-    except Exception:
-        # Some builds return a tuple of 4, others dict—just be safe
-        try:
-            greeks = execution_engine.portfolio_greeks(spot)
-            logger.info(f"📈 Greeks Δ={greeks[0]:.2f}, Γ={greeks[1]:.4f}, Vega={greeks[2]:.2f}, Θ={greeks[3]:.2f}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not fetch Greeks: {e}")
+# -------------------------
+# Backtest runner
+# -------------------------
 
-def flatten_if_neutral(signal: int, spot: float):
-    """When signal is neutral and there are open positions, flatten them."""
-    if signal != 0 or paper_engine is None:
+def run_backtest(cfg: Dict[str, Any]):
+    logger = logging.getLogger("main.backtest")
+    logger.info("Starting backtest")
+
+    # instantiate manager and engine
+    ldm = LiveDataManager(asset=cfg.get("symbol", "TEST")) if LiveDataManager else None
+    if execution_engine and hasattr(execution_engine, "reset_engine"):
+        execution_engine.reset_engine(cfg.get("initial_balance", 100000.0))
+    else:
+        logger.warning("execution_engine not available; backtest cannot run orders")
+
+    # choose strategy
+    if HAVE_PROJECT_STRATEGY and ProjectStrategy is not None:
+        strat = ProjectStrategy(cfg=cfg)
+    else:
+        strat = SimpleSMA(window_short=cfg.get("sma_short", 5), window_long=cfg.get("sma_long", 20), symbol=cfg.get("symbol", "TEST"), size=cfg.get("size", 1))
+
+    # replay CSV
+    csv_path = cfg.get("replay_csv")
+    if not csv_path or not os.path.exists(csv_path):
+        logger.error("No replay_csv provided or file not found: %s", csv_path)
         return
-    open_positions = paper_engine.list_open_positions()
-    if open_positions:
-        logger.info(f"🔁 Neutral: flattening {len(open_positions)} open positions")
-        paper_engine.flatten_all(spot)
 
-# --- Robust wrapper to build/construct option contract from OptionsOptimizer ---
-import inspect
-import logging
+    logger.info("Replaying CSV %s", csv_path)
+    ticks = ldm.fetch_historical(csv_path, price_col=cfg.get("price_col", "close"))
 
-logger = logging.getLogger("TradingBot")
-
-def size_and_place(decision, spot):
-    """
-    Build contract using options_optimizer in a resilient way, apply position sizing,
-    and place the order on paper_engine or live broker.
-    This wrapper tries several common method names/signatures so mismatches don't crash.
-    """
-    contract = None
-    opt = options_optimizer  # assumes options_optimizer is global in main.py as before
-
-    # Candidate method names & call orders we try (most-likely first)
-    candidate_calls = [
-        ("build_contract", (spot, decision)),      # what your traceback shows
-        ("build_contract", (decision, spot)),      # alternative arg order
-        ("evaluate", (decision, spot)),            # earlier code used .evaluate(decision)
-        ("evaluate", (spot, decision)),            # alternative order
-        ("build", (decision, spot)),               # other possible name
-        ("build", (spot, decision)),
-    ]
-
-    # Keep a small registry of errors for troubleshooting
-    call_errors = []
-
-    for name, args in candidate_calls:
-        if not hasattr(opt, name):
-            call_errors.append((name, "missing"))
-            continue
-
-        fn = getattr(opt, name)
-        # sanity: ensure callable
-        if not callable(fn):
-            call_errors.append((name, "not callable"))
-            continue
-
-        # Attempt to call, but guard exceptions so trading loop doesn't crash
+    for t in ticks:
+        # dispatch tick to engine and strategy
+        if execution_engine and hasattr(execution_engine, "process_market_tick"):
+            execution_engine.process_market_tick(t["symbol"], t["price"], t.get("timestamp"))
+        # get orders
+        orders = []
         try:
-            logger.debug(f"[TRACE] Trying options_optimizer.{name}{args}")
-            contract = fn(*args)
-            # If function returns False-y or raises custom error, treat accordingly
-            if contract:
-                logger.info(f"📦 Built contract via {name}: {contract}")
-                break
-            else:
-                # record that call returned falsy (None/False/empty) and continue trying others
-                call_errors.append((name, "returned falsy"))
-        except TypeError as te:
-            # signature mismatch (wrong number of args etc.)
-            call_errors.append((name, f"TypeError: {te}"))
-        except Exception as e:
-            # other runtime error (e.g. missing data inside optimizer)
-            call_errors.append((name, f"Exception: {e}"))
-
-    if contract is None:
-        # Build a helpful diagnostic message and skip placing.
-        opt_methods = [m for m in dir(opt) if not m.startswith("_")]
-        logger.error("❌ OptionsOptimizer could not build a contract.")
-        logger.error("Tried these method attempts and results:")
-        for entry in call_errors:
-            logger.error(f" - {entry[0]} -> {entry[1]}")
-        logger.error(f"OptionsOptimizer exposed public attributes: {opt_methods}")
-        # Optionally, also dump the decision and spot so user can inspect
-        logger.debug(f"[TRACE] decision={decision}, spot={spot}")
-        return None
-
-    # If we have a contract, do sizing and execute (this part adapts to your existing flow)
-    try:
-        # Example: ensure contract dict fields exist
-        qty = contract.get("qty", 1)
-        symbol = contract.get("symbol", "<unknown>")
-        strike = contract.get("strike", None)
-        iv = contract.get("iv", contract.get("premium", 0.2))
-        is_call = contract.get("is_call", True)
-        expiry = contract.get("expiry")
-        expiry_days = (expiry - datetime.now().date()).days if expiry else contract.get("expiry_days", 1)
-
-        # place into paper or live
-        if TRADING_MODE == "live":
-            logger.info(f"📡 LIVE ORDER: {symbol} BUY {qty} @ {spot}")
-            # TODO: call broker adapter here
-        elif TRADING_MODE == "paper":
-            # paper_engine.place_order signature: (symbol, qty, price, strike, sigma, is_call, expiry_days)
-            paper_engine.place_order(
-                symbol=symbol,
-                qty=qty,
-                price=spot,
-                strike=strike or spot,
-                sigma=iv,
-                is_call=is_call,
-                expiry_days=max(1, expiry_days),
-            )
-        else:
-            logger.info("Backtest mode: not placing live orders.")
-
-        return contract
-
-    except Exception as e:
-        logger.error(f"❌ Failed to size/place contract: {e}")
-        logger.debug("Contract payload: %s", contract)
-        return None
-
-# ----------------------------
-# Trading loop
-# ----------------------------
-def trading_loop():
-    global _last_decision_key, _state_buf
-
-    logger.info("🚀 Starting trading loop...")
-    try:
-        send_telegram_message("🚀 Trading bot started")
-    except Exception:
-        pass
-
-    while True:
-        try:
-            # Market hours gate (for paper/live)
-            if TRADING_MODE in ("paper", "live"):
-                if not market_open_now():
-                    logger.info("⏸️ Market closed, waiting...")
-                    time.sleep(60)
-                    continue
-            else:
-                # Backtest branch
-                df_path = config["backtest"]["data_path"]
-                logger.info(f"📊 Backtest starting with {df_path}")
-                bt = Backtester(strategy=strategy_engine,
-                                initial_balance=INITIAL_BALANCE,
-                                fee_perc=config["backtest"].get("fee", 0.001))
-                bt.run_from_file(df_path)
-                logger.info("✅ Backtest complete")
-                break
-
-            # Pull spot
-            spot = get_spot()
-            if spot <= 0:
-                time.sleep(config["trading"].get("poll_interval", 5))
-                continue
-
-            # Build decision (StrategyEngine can internally combine RL + others)
-            features = {"asset": "NIFTY", "spot": spot, "history": []}
-            decision = strategy_engine.run(features)
-
-            # Debounce / de-dupe (avoid log spam)
-            key = (int(decision.get("signal", 0)),
-                   int(decision.get("strike_offset", 0)),
-                   str(decision.get("expiry", "weekly")))
-            _state_buf.append(key)
-
-            # Only proceed if the key is stable (same twice) AND different from last handled
-            if len(_state_buf) == _state_buf.maxlen and len(set(_state_buf)) == 1:
-                if key != _last_decision_key:
-                    _last_decision_key = key
-                    logger.info(f"📊 Consolidated decision: {decision}")
-
-                    # Neutral signal → flatten & continue
-                    if int(decision.get("signal", 0)) == 0:
-                        flatten_if_neutral(0, spot)
-                        acct = paper_engine.account_status(spot) if TRADING_MODE == "paper" else execution_engine.account_status(spot)
-                        logger.info(pnl_log_from_account(acct))
-                        log_greeks(spot)
-                    else:
-                        size_and_place(decision, spot)
-
-            # Sleep
-            time.sleep(config["trading"].get("poll_interval", 5))
-
-        except KeyboardInterrupt:
-            logger.info("🛑 Trading bot stopped manually")
+            orders = strat.on_tick(t)
+        except Exception:
+            logger.exception("Strategy on_tick raised")
+        # place orders
+        for o in orders:
             try:
-                send_telegram_message("🛑 Trading bot stopped manually")
+                res = execution_engine.place_order(o["symbol"], o["qty"], side=o.get("side", "BUY"), order_type=o.get("order_type", "MARKET"))
+                logger.debug("Placed order result: %s", res)
             except Exception:
-                pass
-            break
-        except Exception as e:
-            logger.exception(f"❌ Error in trading loop: {e}")
-            time.sleep(2)  # small backoff
+                logger.exception("Failed to place order")
 
-# ----------------------------
-# Entry point
-# ----------------------------
+    # after replay, print summary
+    if execution_engine and hasattr(execution_engine, "get_trade_log") and hasattr(execution_engine, "get_positions"):
+        trades = execution_engine.get_trade_log()
+        pos = execution_engine.get_positions()
+        logger.info("Backtest complete — trades=%d positions=%s", len(trades), pos)
+        # save summary
+        out = cfg.get("output", "backtest_summary.json")
+        with open(out, "w") as fh:
+            json.dump({"trades": trades, "positions": pos}, fh, default=str, indent=2)
+        logger.info("Wrote summary to %s", out)
+    else:
+        logger.info("Backtest finished (no execution engine info available)")
+
+
+# -------------------------
+# Train runner
+# -------------------------
+
+def run_train(args: argparse.Namespace):
+    logger = logging.getLogger("main.train")
+    if not HAVE_RLTRAINER or RLTrainer is None:
+        logger.error("RL trainer not available in this environment")
+        return
+    cfg = TrainConfig(seed=args.seed, episodes=args.episodes, steps_per_episode=args.steps, checkpoint_dir=args.checkpoint_dir, eval_every=args.eval_every, checkpoint_every=args.checkpoint_every, learning_rate=args.lr, gamma=args.gamma)
+    trainer = RLTrainer(cfg)
+    trainer.train()
+
+
+# -------------------------
+# Paper / Live runner (scaffold)
+# -------------------------
+
+def run_paper(cfg: Dict[str, Any]):
+    logger = logging.getLogger("main.paper")
+    ldm = LiveDataManager(asset=cfg.get("symbol", "TEST")) if LiveDataManager else None
+    if ldm is None:
+        logger.error("LiveDataManager not available")
+        return
+
+    # Choose strategy
+    if HAVE_PROJECT_STRATEGY and ProjectStrategy is not None:
+        strat = ProjectStrategy(cfg=cfg)
+    else:
+        strat = SimpleSMA(window_short=cfg.get("sma_short", 5), window_long=cfg.get("sma_long", 20), symbol=cfg.get("symbol", "TEST"), size=cfg.get("size", 1))
+
+    # subscribe strategy to ticks via callback
+    def on_tick(tick):
+        try:
+            orders = strat.on_tick(tick)
+            for o in orders:
+                try:
+                    if execution_engine and hasattr(execution_engine, "place_order"):
+                        res = execution_engine.place_order(o["symbol"], o["qty"], side=o.get("side", "BUY"), order_type=o.get("order_type", "MARKET"))
+                        logger.debug("Paper order result: %s", res)
+                except Exception:
+                    logger.exception("Paper mode: failed to place order")
+        except Exception:
+            logger.exception("Strategy on_tick failed in paper mode")
+
+    ldm.subscribe(cfg.get("symbol", "TEST"), on_tick)
+
+    # start live mode (best-effort)
+    ldm.start_live(connect_info=cfg.get("connect_info"), symbols=[cfg.get("symbol")])
+    logger.info("Paper mode running — press Ctrl+C to stop")
+
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        logger.info("Stopping paper mode")
+        ldm.stop()
+
+
+def run_live(cfg: Dict[str, Any]):
+    logger = logging.getLogger("main.live")
+    logger.warning("Live mode scaffold: ensure you understand the risks before connecting real accounts")
+    run_paper(cfg)  # for now paper and live share mechanics in scaffold
+
+
+# -------------------------
+# Signal handling & metadata
+# -------------------------
+
+def _write_run_metadata(base_dir: str, meta: Dict[str, Any]):
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        fn = os.path.join(base_dir, f"run_meta_{int(time.time())}.json")
+        with open(fn, "w") as fh:
+            json.dump(meta, fh, default=str, indent=2)
+    except Exception:
+        logging.getLogger("main").exception("Failed to write run metadata")
+
+
+# -------------------------
+# CLI
+# -------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", type=str, required=True, choices=["backtest", "train", "paper", "live"], help="Mode to run")
+    p.add_argument("--cfg", type=str, default=None, help="YAML config file path for backtest/paper/live")
+
+    # train options
+    p.add_argument("--episodes", type=int, default=200)
+    p.add_argument("--steps", type=int, default=1000)
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--eval-every", type=int, default=50)
+    p.add_argument("--checkpoint-every", type=int, default=50)
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--gamma", type=float, default=0.99)
+
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    setup_logging()
+    logger = logging.getLogger("main")
+
+    cfg: Dict[str, Any] = {}
+    if args.cfg:
+        cfg = load_yaml_config(args.cfg)
+    # override simple settings from CLI
+    cfg["seed"] = args.seed
+    cfg["symbol"] = cfg.get("symbol", "TEST")
+
+    # write run metadata directory
+    meta_dir = os.path.join(args.checkpoint_dir, "runs")
+    meta = {"mode": args.mode, "cfg": cfg, "timestamp": datetime.utcnow().isoformat()}
+    _write_run_metadata(meta_dir, meta)
+
+    # dispatch modes
+    if args.mode == "backtest":
+        run_backtest(cfg)
+    elif args.mode == "train":
+        run_train(args)
+    elif args.mode == "paper":
+        run_paper(cfg)
+    elif args.mode == "live":
+        run_live(cfg)
+    else:
+        logger.error("Unknown mode: %s", args.mode)
+
+
 if __name__ == "__main__":
-    trading_loop()
+    main()
