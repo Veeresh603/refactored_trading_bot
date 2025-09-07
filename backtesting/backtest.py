@@ -89,12 +89,66 @@ class Backtester:
         self.allow_short = bool(allow_short)
 
     def _normalize_signals(self, sig: Iterable[int]) -> np.ndarray:
-        arr = np.asarray(list(sig), dtype=int)
+        """
+        Normalize various signal return types into an integer numpy array with values in {-1,0,1}.
+        Accepts:
+          - python iterables (lists, tuples, generators) of ints
+          - numpy arrays
+          - pandas.Series (will be converted to ints)
+          - pandas.DataFrame (tries common column names 'signal','signals','position','pos','action',
+            or uses the first column if the DF has exactly one column).
+        After extraction, clamps values >1 -> 1, < -1 -> -1, and if allow_short==False sets negative to 0.
+        """
+        import pandas as pd
+
+        # If it's a pandas Series, use its values
+        if isinstance(sig, pd.Series):
+            try:
+                arr = sig.to_numpy(dtype=int)
+            except Exception as e:
+                # try numeric conversion first
+                arr = pd.to_numeric(sig, errors="coerce").fillna(0).astype(int).to_numpy()
+        # If it's a pandas DataFrame, try to locate common column or fallback to single-col
+        elif isinstance(sig, pd.DataFrame):
+            # look for common column names used by strategies
+            for col in ("signal", "signals", "position", "pos", "action"):
+                if col in sig.columns:
+                    try:
+                        arr = sig[col].to_numpy(dtype=int)
+                        break
+                    except Exception:
+                        arr = pd.to_numeric(sig[col], errors="coerce").fillna(0).astype(int).to_numpy()
+                        break
+            else:
+                # fallback: if single-column DF, take that column
+                if sig.shape[1] == 1:
+                    try:
+                        arr = sig.iloc[:, 0].to_numpy(dtype=int)
+                    except Exception:
+                        arr = pd.to_numeric(sig.iloc[:, 0], errors="coerce").fillna(0).astype(int).to_numpy()
+                else:
+                    raise ValueError("Strategy returned a DataFrame with multiple columns; cannot infer signal column. "
+                                     "Return a 1-D array/Series or a DataFrame with a 'signal' column.")
+        else:
+            # fallback for sequences, numpy arrays, lists, generators, etc.
+            try:
+                arr = np.asarray(list(sig), dtype=int)
+            except Exception:
+                # last-resort: try to coerce to numeric with numpy
+                try:
+                    arr = np.asarray(sig, dtype=int)
+                except Exception:
+                    raise ValueError("Unable to convert signals to integer array. "
+                                     "Signals must be iterable of ints, numpy array, pandas Series, or single-column DataFrame.")
+
+        # enforce shape and values
+        arr = np.asarray(arr, dtype=int)
         arr[arr > 1] = 1
         arr[arr < -1] = -1
         if not self.allow_short:
             arr[arr < 0] = 0
         return arr
+
 
     def run(
         self,
@@ -114,10 +168,19 @@ class Backtester:
             raise KeyError(f"Price column '{price_col}' not found in DataFrame")
         original_index = df.index
 
-        df = df.reset_index(drop=False) if datetime_col else df.reset_index(drop=True)
-        n = len(df)
+        # Reset index as before but keep mapping
+        df_reset = df.reset_index(drop=False) if datetime_col else df.reset_index(drop=True)
+        n = len(df_reset)
         if n == 0:
             raise ValueError("Empty dataframe passed to backtester")
+
+        # ---- MICRO-OPT: extract price and volume arrays once ----
+        price_arr = df_reset[price_col].to_numpy(dtype=float)
+        if "volume" in df_reset.columns:
+            vol_arr = df_reset["volume"].to_numpy(dtype=float)
+        else:
+            vol_arr = np.zeros(n, dtype=float)
+        # ---------------------------------------------------------
 
         # signals
         if signals is None:
@@ -156,16 +219,16 @@ class Backtester:
             else:
                 return float(raw_price * (1.0 - base - impact))
 
-        for i, row in df.iterrows():
-            current_price = float(row[price_col])
-            bar_volume = float(row.get("volume", 0.0))
+        # main loop now iterates by index and uses price_arr/vol_arr
+        for i in range(n):
+            current_price = float(price_arr[i])
+            bar_volume = float(vol_arr[i])
 
-            # === Fix: when volume present use fraction only; only fallback to order_unit_size when volume == 0
+            # === Fix: when volume present use fraction only; fallback to order_unit_size when volume == 0
             if self.orderbook_sampler is None:
                 if bar_volume > 0.0:
                     available_liquidity_value = float(bar_volume * self.liquidity_fraction)
                 else:
-                    # no volume info -> allow at least requested order_unit_size (preserve earlier tests that omit volume)
                     available_liquidity_value = float(order_unit_size)
             else:
                 available_liquidity_value = None
@@ -174,7 +237,7 @@ class Backtester:
             current_side = 0 if abs(position_units) < 1e-12 else (1 if position_units > 0 else -1)
             target_side = s
 
-            # enqueue logic: closing order for flat, or order to change to target_side
+            # enqueue logic: closing order or change-of-side
             if target_side == 0 and current_side != 0:
                 requested_closing = -position_units
                 requested_abs = abs(requested_closing)
@@ -237,7 +300,7 @@ class Backtester:
                     if exec_actual <= 0.0:
                         remaining_queue.append(order)
                         continue
-                    fill_price = float(ob_res["vwap"]) if ob_res["vwap"] is not None else current_price
+                    fill_price = float(ob_res["vwap"]) if ob_res.get("vwap", None) is not None else current_price
                     executed_units = exec_actual
                 else:
                     executed_units = float(execable)
@@ -318,3 +381,4 @@ class Backtester:
         }
 
         return equity_series, trades_df, metrics
+

@@ -1,57 +1,95 @@
 # backtesting/tca.py
 """
-Basic TCA/impact parameter fitter.
+TCA helpers: fit simple power-law market impact model and estimate impact from params.
 
-We fit a simple power-law model:
+Model:
     impact = a * (size / adv) ** b
-Where `impact` is signed price movement observed (absolute adverse slippage),
-`size` is execution size, and `adv` is average daily volume (or other normalizer).
 
-Fitting is performed on logs:
-    log(impact) = log(a) + b * log(size/adv)
-
-This module provides a simple least-squares fit and a utility to estimate slippage
-for a hypothetical execution share_of_liq.
+Functions:
+- fit_powerlaw_impact(sizes, advs, impacts) -> {"a":..., "b":...}
+- estimate_impact_from_params(size, adv, params) -> fractional impact (0..)
+- calibrate_powerlaw(sizes, advs, impacts) -> returns (a,b) tuple (compat layer)
 """
 
 from __future__ import annotations
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Tuple
+import math
+
 import numpy as np
 
+def _safe_log(x: np.ndarray) -> np.ndarray:
+    """Numerically safe log (clip tiny positives)."""
+    return np.log(np.clip(x, 1e-12, None))
 
-def fit_powerlaw_impact(sizes: Iterable[float], advs: Iterable[float], impacts: Iterable[float]) -> Dict[str, float]:
+
+def fit_powerlaw_impact(sizes: np.ndarray, advs: np.ndarray, impacts: np.ndarray) -> Dict[str, float]:
     """
-    Fit model: impact = a * (size / adv) ** b.
-    sizes, advs, impacts must be same-length iterables, impacts > 0.
-    Returns dict {a, b, r2}.
+    Fit impact = a * (size/adv)^b by linearizing log(impact) = log(a) + b * log(size/adv)
+    Returns dict {"a": float, "b": float}.
+
+    args are numpy arrays of matching length.
     """
-    sizes = np.asarray(list(sizes), dtype=float)
-    advs = np.asarray(list(advs), dtype=float)
-    impacts = np.asarray(list(impacts), dtype=float)
+    sizes = np.asarray(sizes, dtype=float)
+    advs = np.asarray(advs, dtype=float)
+    impacts = np.asarray(impacts, dtype=float)
 
-    # filter valid positive
-    mask = (sizes > 0) & (advs > 0) & (impacts > 0)
-    if mask.sum() < 3:
-        return {"a": 0.0, "b": 0.0, "r2": 0.0}
-    x = np.log(sizes[mask] / advs[mask])
-    y = np.log(impacts[mask])
-    A = np.vstack([np.ones_like(x), x]).T
-    coeffs, residuals, rank, s = np.linalg.lstsq(A, y, rcond=None)
-    loga, b = coeffs[0], coeffs[1]
-    a = float(np.exp(loga))
-    # r2
-    y_pred = loga + b * x
-    ss_res = np.sum((y - y_pred) ** 2)
-    ss_tot = np.sum((y - y.mean()) ** 2)
-    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
-    return {"a": a, "b": float(b), "r2": r2}
+    # sanity: require positive adv and sizes
+    mask = (advs > 0) & (sizes > 0) & (impacts > 0)
+    if mask.sum() < 2:
+        # fallback default small impact
+        return {"a": 0.0, "b": 0.0}
+
+    x = sizes[mask] / advs[mask]
+    y = impacts[mask]
+
+    lx = _safe_log(x)
+    ly = _safe_log(y)
+
+    # linear least squares: ly = log(a) + b * lx
+    A = np.vstack([np.ones_like(lx), lx]).T
+    try:
+        sol, *_ = np.linalg.lstsq(A, ly, rcond=None)
+        loga, b = float(sol[0]), float(sol[1])
+        a = float(math.exp(loga))
+    except Exception:
+        # fallback
+        a, b = 0.0, 0.0
+
+    # Ensure numeric scalars
+    if not np.isfinite(a):
+        a = 0.0
+    if not np.isfinite(b):
+        b = 0.0
+
+    return {"a": float(a), "b": float(b)}
 
 
-def estimate_impact_from_params(size: float, adv: float, params: Dict[str, float]) -> float:
-    """Return predicted impact (absolute price fraction) given params and normalization adv."""
-    a = float(params.get("a", 0.0))
-    b = float(params.get("b", 0.0))
-    if size <= 0 or adv <= 0 or a == 0.0:
+def estimate_impact_from_params(executed_units: float, bar_volume: float, params: Dict[str, float]) -> float:
+    """
+    Estimate fractional impact (e.g., 0.01 => 1% impact) using params {"a":..., "b":...}.
+    If bar_volume==0 returns 0.0.
+    """
+    try:
+        a = float(params.get("a", 0.0))
+        b = float(params.get("b", 0.0))
+    except Exception:
         return 0.0
-    frac = (size / adv)
-    return float(a * (frac ** b))
+
+    if bar_volume <= 0 or executed_units <= 0:
+        return 0.0
+
+    frac = (executed_units / float(bar_volume))
+    # guard: negative/inf
+    if not np.isfinite(frac) or frac <= 0.0:
+        return 0.0
+
+    try:
+        return float(a * (frac ** b))
+    except Exception:
+        return 0.0
+
+
+# convenience wrapper for older tests expecting tuple return
+def calibrate_powerlaw(sizes: np.ndarray, advs: np.ndarray, impacts: np.ndarray) -> Tuple[float, float]:
+    d = fit_powerlaw_impact(sizes, advs, impacts)
+    return float(d.get("a", 0.0)), float(d.get("b", 0.0))

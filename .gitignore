@@ -7,6 +7,7 @@ __pycache__/
 *.pyd
 *.so
 *.dll
+*.ckpt
 
 # Virtual environments
 .venv/
@@ -40,6 +41,7 @@ historical_data/
 *.cache
 *.tmp
 *.json
+*.ckpt
 
 # Build / Dist
 build/
@@ -71,3 +73,5 @@ core/execution_engine.cp*.pyd
 .DS_Store
 Thumbs.db
 .json
+dummy.py
+.ckpt

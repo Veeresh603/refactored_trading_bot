@@ -24,7 +24,7 @@ try:
 except Exception:
     HAVE_PANDAS_TA = False
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def compute_rsi(series: pd.Series, window: int = 14) -> pd.Series:
@@ -154,7 +154,7 @@ def main(argv=None):
     np.save(os.path.join(args.out_dir, "features.npy"), X)
     np.save(os.path.join(args.out_dir, "labels.npy"), y)
     meta = {
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": datetime.now(timezone.utc).isoformat() + "Z",
         "n_samples": int(X.shape[0]),
         "n_features": int(X.shape[1]),
         "feature_cols": feature_cols,

@@ -26,7 +26,7 @@ import sys
 import time
 import signal
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 # Defensive imports (fall back to local implementations we created earlier)
@@ -294,7 +294,7 @@ def main():
 
     # write run metadata directory
     meta_dir = os.path.join(args.checkpoint_dir, "runs")
-    meta = {"mode": args.mode, "cfg": cfg, "timestamp": datetime.utcnow().isoformat()}
+    meta = {"mode": args.mode, "cfg": cfg, "timestamp": datetime.now(timezone).isoformat()}
     _write_run_metadata(meta_dir, meta)
 
     # dispatch modes

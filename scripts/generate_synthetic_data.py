@@ -13,7 +13,7 @@ Usage:
 from __future__ import annotations
 import os
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import math
 import random
 
@@ -86,7 +86,7 @@ def main():
     if args.start:
         start = datetime.fromisoformat(args.start)
     else:
-        start = datetime.utcnow() - timedelta(days=args.days)
+        start = datetime.now(timezone.utc) - timedelta(days=args.days)
 
     df = build_dataframe(start=start, periods=periods, freq_minutes=freq_minutes, S0=20000.0)
 
